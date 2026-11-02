@@ -98,7 +98,8 @@ async def check_second_higher_timeframe_alignment(client, symbol: str, timeframe
     }
 
 
-async def check_btc_correlation(client, symbol: str, timeframe: str) -> dict | None:
+async def check_btc_correlation(client, symbol: str, timeframe: str,
+                                symbol_df: pd.DataFrame | None = None) -> dict | None:
     """
     محاسبه‌ی همبستگی بازدهی این ارز با بیت‌کوین روی همین تایم‌فریم.
     خروجی: {"correlation": float, "high_correlation": bool} یا None اگه
@@ -107,9 +108,14 @@ async def check_btc_correlation(client, symbol: str, timeframe: str) -> dict | N
     if symbol == BTC_SYMBOL:
         return None
 
+    # اگه کندل‌های همین نماد/تایم‌فریم از قبل دریافت شده (symbol_df)، دوباره
+    # دانلود نمی‌کنیم؛ آخرین LOOKBACK+5 کندل همان چیزی است که fetch جدا می‌داد.
     try:
         btc_df = await client.fetch_ohlcv_df(BTC_SYMBOL, timeframe, limit=BTC_CORRELATION_LOOKBACK + 5)
-        symbol_df = await client.fetch_ohlcv_df(symbol, timeframe, limit=BTC_CORRELATION_LOOKBACK + 5)
+        if symbol_df is None:
+            symbol_df = await client.fetch_ohlcv_df(symbol, timeframe, limit=BTC_CORRELATION_LOOKBACK + 5)
+        else:
+            symbol_df = symbol_df.tail(BTC_CORRELATION_LOOKBACK + 5).reset_index(drop=True)
     except Exception:
         return None
 

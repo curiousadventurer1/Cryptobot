@@ -19,6 +19,7 @@ from news import news_item_key
 
 logger = logging.getLogger(__name__)
 NEWS_SEND_TIMEOUT_SECONDS = 60  # shorter than the DB reservation lease (10 minutes)
+SCAN_CONCURRENCY = 5  # حداکثر نماد هم‌زمان در اسکن/قیمت‌گیری پس‌زمینه (rate-limit ccxt همچنان اعمال می‌شود)
 
 
 async def _background_recipients(user_ids, kind: str) -> set[int]:
@@ -54,46 +55,58 @@ async def scan_job(app: Application):
         symbol_to_users[symbol].append(user_id)
 
     client = ExchangeClient()
-    try:
-        for symbol, user_ids in symbol_to_users.items():
+    semaphore = asyncio.Semaphore(SCAN_CONCURRENCY)
+
+    async def _scan_symbol(symbol, user_ids):
+        async with semaphore:
             try:
                 result = await analyze_symbol(client, symbol)
             except Exception as e:
                 logger.warning(f"خطا در تحلیل {symbol}: {e}")
+                return
+
+        last = await db.get_last_signal(
+            symbol, source=db.SIGNAL_SOURCE_MULTI_TIMEFRAME
+        )
+        should_notify = (
+            result.signal_type != "NEUTRAL"
+            and (last is None or last["signal_type"] != result.signal_type)
+        )
+
+        await db.log_signal(
+            symbol, result.signal_type, result.total_score, result.current_price,
+            source=db.SIGNAL_SOURCE_MULTI_TIMEFRAME,
+        )
+
+        if not should_notify:
+            return
+
+        emoji = SIGNAL_EMOJI[result.signal_type]
+        text = (
+            f"{emoji} *هشدار سیگنال جدید*\n\n"
+            f"نماد: `{symbol}`\n"
+            f"قیمت: `{result.current_price:,.4f}`\n"
+            f"سیگنال: *{SIGNAL_FA[result.signal_type]}*\n"
+            f"امتیاز: `{result.total_score}`/`{result.max_possible_score}`\n\n"
+            f"⚠️ توصیه مالی نیست."
+        )
+        for user_id in user_ids:
+            if not await _can_send_background(user_id, "scan", symbol):
                 continue
+            try:
+                await app.bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.MARKDOWN)
+            except Exception as e:
+                logger.warning(f"ارسال پیام به {user_id} ناموفق بود: {e}")
 
-            last = await db.get_last_signal(
-                symbol, source=db.SIGNAL_SOURCE_MULTI_TIMEFRAME
-            )
-            should_notify = (
-                result.signal_type != "NEUTRAL"
-                and (last is None or last["signal_type"] != result.signal_type)
-            )
-
-            await db.log_signal(
-                symbol, result.signal_type, result.total_score, result.current_price,
-                source=db.SIGNAL_SOURCE_MULTI_TIMEFRAME,
-            )
-
-            if not should_notify:
-                continue
-
-            emoji = SIGNAL_EMOJI[result.signal_type]
-            text = (
-                f"{emoji} *هشدار سیگنال جدید*\n\n"
-                f"نماد: `{symbol}`\n"
-                f"قیمت: `{result.current_price:,.4f}`\n"
-                f"سیگنال: *{SIGNAL_FA[result.signal_type]}*\n"
-                f"امتیاز: `{result.total_score}`/`{result.max_possible_score}`\n\n"
-                f"⚠️ توصیه مالی نیست."
-            )
-            for user_id in user_ids:
-                if not await _can_send_background(user_id, "scan", symbol):
-                    continue
-                try:
-                    await app.bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.MARKDOWN)
-                except Exception as e:
-                    logger.warning(f"ارسال پیام به {user_id} ناموفق بود: {e}")
+    try:
+        # چند نماد هم‌زمان (با سقف) به‌جای پشت‌سرهم؛ خطای یک نماد بقیه رو متوقف نمی‌کنه
+        outcomes = await asyncio.gather(
+            *(_scan_symbol(symbol, user_ids) for symbol, user_ids in symbol_to_users.items()),
+            return_exceptions=True,
+        )
+        for outcome in outcomes:
+            if isinstance(outcome, Exception):
+                logger.warning("خطای پیش‌بینی‌نشده در اسکن یک نماد: %s", outcome)
     finally:
         await client.close()
     logger.info("اسکن خودکار تمام شد.")
@@ -139,12 +152,17 @@ async def check_signal_performance_job(app: Application):
     symbols = {s["symbol"] for s in open_signals}
     client = ExchangeClient()
     prices = {}
-    try:
-        for symbol in symbols:
+    semaphore = asyncio.Semaphore(SCAN_CONCURRENCY)
+
+    async def _fetch_price(symbol):
+        async with semaphore:
             try:
                 prices[symbol] = await client.fetch_ticker_price(symbol)
             except Exception as e:
                 logger.warning(f"دریافت قیمت {symbol} ناموفق بود: {e}")
+
+    try:
+        await asyncio.gather(*(_fetch_price(symbol) for symbol in symbols))
     finally:
         await client.close()
 

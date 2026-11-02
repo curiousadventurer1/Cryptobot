@@ -56,6 +56,7 @@
 در معامله‌گری حرفه‌ای.
 """
 from dataclasses import dataclass, field
+import numpy as np
 import pandas as pd
 from trade_validation import validate_signal_output
 from market_data_validation import validate_ohlcv_frame
@@ -207,17 +208,22 @@ MIN_DIVERGENCE_INDICATOR_GAP_STD_MULT = 0.5  # حداقل اختلاف اندی�
 
 
 def _find_pivots(series: pd.Series, window: int, find_highs: bool) -> list[int]:
-    """اندیس‌های سقف یا کف‌های محلی رو برمی‌گردونه (مقایسه با window کندل هر طرف)"""
-    idxs = []
-    n = len(series)
-    for i in range(window, n - window):
-        segment = series.iloc[i - window: i + window + 1]
-        center = series.iloc[i]
-        if find_highs and center == segment.max() and (segment == center).sum() == 1:
-            idxs.append(i)
-        elif not find_highs and center == segment.min() and (segment == center).sum() == 1:
-            idxs.append(i)
-    return idxs
+    """
+    اندیس‌های سقف یا کف‌های محلی رو برمی‌گردونه (مقایسه با window کندل هر طرف).
+    نسخهٔ برداری (numpy) با همان قاعدهٔ قبلی: مرکز باید max/min پنجره باشد
+    و در آن پنجره یکتا باشد. خروجی دقیقاً با حلقهٔ قبلی برابر است.
+    """
+    values = series.to_numpy(dtype=float)
+    n = len(values)
+    span = 2 * window + 1
+    if n < span:
+        return []
+    windows = np.lib.stride_tricks.sliding_window_view(values, span)
+    centers = values[window:n - window]
+    extreme = windows.max(axis=1) if find_highs else windows.min(axis=1)
+    unique = (windows == centers[:, None]).sum(axis=1) == 1
+    mask = (centers == extreme) & unique
+    return (np.nonzero(mask)[0] + window).tolist()
 
 
 def _detect_rsi_divergence(df: pd.DataFrame) -> dict | None:

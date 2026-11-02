@@ -24,6 +24,9 @@ NEWS_DELIVERY_LEASE_SECONDS = 10 * 60
 async def init_db():
     """ساخت جداول و مهاجرت افزایشی پایش/تاریخچه، بدون بازنویسی رکوردها."""
     async with aiosqlite.connect(DB_PATH) as db:
+        # WAL: خواننده‌ها دیگر پشت نویسنده‌ها قفل نمی‌شوند (مهم با پردازش هم‌زمان آپدیت‌ها).
+        # این تنظیم داخل خود فایل دیتابیس ماندگار است. sqlite3.backup() با WAL سازگار است.
+        await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -172,6 +175,19 @@ async def init_db():
                 )
             )
         """)
+        # ایندکس‌های کوئری‌های پرتکرار (فقط افزودنی؛ داده‌ای تغییر نمی‌کند)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_signal_performance_user_status
+            ON signal_performance (user_id, status)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_signal_performance_lookup
+            ON signal_performance (symbol, timeframe, direction, status)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_signal_history_created_at
+            ON signal_history (created_at)
+        """)
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_news_delivery_reserved_claim
             ON news_delivery (user_id, claim_token) WHERE status = 'reserved'
@@ -299,13 +315,22 @@ async def release_news_delivery_claim(user_id: int, token: str, news_keys) -> bo
     return await _finish_news_delivery(user_id, token, news_keys, sent=False)
 
 
+_known_usernames: dict[int, str] = {}
+_KNOWN_USERNAMES_MAX = 100_000
+
+
 async def add_user(user_id: int, username: str) -> bool:
     """
     ثبت کاربر - اگه قبلاً وجود داشته باشه، فقط یوزرنیمش بروزرسانی می‌شه
     (چون ممکنه کاربر یوزرنیمش رو عوض کرده باشه)، تاریخ عضویت اولیه‌ش
     دست‌نخورده می‌مونه. خروجی: True اگه این اولین باری بود که این کاربر
     دیده می‌شد (کاربر تازه)، False اگه از قبل وجود داشت.
+
+    چون با هر پیام/کلیک صدا زده می‌شه، اگه همین یوزرنیم در همین پروسه
+    قبلاً ثبت شده باشه، اصلاً به دیتابیس نمی‌نویسیم (فقط کش حافظه‌ای).
     """
+    if _known_usernames.get(user_id) == username:
+        return False
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
         is_new = await cursor.fetchone() is None
@@ -315,7 +340,31 @@ async def add_user(user_id: int, username: str) -> bool:
             (user_id, username, datetime.utcnow().isoformat())
         )
         await db.commit()
-        return is_new
+    if len(_known_usernames) >= _KNOWN_USERNAMES_MAX:
+        _known_usernames.clear()
+    _known_usernames[user_id] = username
+    return is_new
+
+
+async def get_access_snapshot(user_id: int) -> dict:
+    """
+    وضعیت دسترسی کاربر با یک اتصال (به‌جای سه اتصال جدا برای مسدودی،
+    حالت دسترسی و لیست سفید). بدون کش - هر بار تازه خوانده می‌شود.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """SELECT
+                   EXISTS(SELECT 1 FROM blocked_users WHERE user_id = ?),
+                   (SELECT value FROM bot_settings WHERE key = 'access_mode'),
+                   EXISTS(SELECT 1 FROM whitelist_users WHERE user_id = ?)""",
+            (user_id, user_id)
+        )
+        blocked, access_mode, whitelisted = await cursor.fetchone()
+    return {
+        "blocked": bool(blocked),
+        "access_mode": access_mode if access_mode is not None else "open",
+        "whitelisted": bool(whitelisted),
+    }
 
 
 async def add_to_watchlist(user_id: int, symbol: str) -> bool:
@@ -536,9 +585,13 @@ async def get_bot_stats() -> dict:
         )).fetchone())[0]
         total_watchlist = (await (await db.execute("SELECT COUNT(*) FROM watchlist")).fetchone())[0]
         total_blocked = (await (await db.execute("SELECT COUNT(*) FROM blocked_users")).fetchone())[0]
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today_dt = datetime.utcnow()
+        today = today_dt.strftime("%Y-%m-%d")
+        tomorrow = (today_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+        # بازه‌ی رشته‌ای ISO معادل LIKE 'YYYY-MM-DD%' است ولی از ایندکس created_at استفاده می‌کند
         signals_today = (await (await db.execute(
-            "SELECT COUNT(*) FROM signal_history WHERE created_at LIKE ?", (f"{today}%",)
+            "SELECT COUNT(*) FROM signal_history WHERE created_at >= ? AND created_at < ?",
+            (today, tomorrow)
         )).fetchone())[0]
         return {
             "total_users": total_users,

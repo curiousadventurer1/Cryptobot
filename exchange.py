@@ -2,19 +2,79 @@
 لایه ارتباط با صرافی (Binance) از طریق ccxt
 فقط از endpoint های عمومی استفاده می‌شه - نیازی به API Key نیست
 """
+import asyncio
+import logging
+import time
+
 import ccxt.async_support as ccxt
 import pandas as pd
 from config import EXCHANGE_ID
 from market_data_validation import ohlcv_frame_from_raw
 
+logger = logging.getLogger(__name__)
+
+# یک نمونهٔ مشترک ccxt برای کل پروسه: بازارها فقط یک‌بار دانلود می‌شوند و
+# rate-limiter داخلی ccxt بین همهٔ درخواست‌های هم‌زمان مشترک است.
+MARKETS_REFRESH_SECONDS = 6 * 3600
+
+_shared_exchange = None
+_markets_loaded_at = 0.0
+_markets_lock = None
+
+
+def _get_shared_exchange():
+    global _shared_exchange
+    if _shared_exchange is None:
+        exchange_class = getattr(ccxt, EXCHANGE_ID)
+        _shared_exchange = exchange_class({"enableRateLimit": True})
+    return _shared_exchange
+
+
+async def ensure_markets_loaded(force: bool = False):
+    """بارگذاری/تازه‌سازی بازارها با قفل؛ اگر تازه‌سازی شکست بخورد، لیست قبلی حفظ می‌شود."""
+    global _markets_loaded_at, _markets_lock
+    exchange = _get_shared_exchange()
+    fresh = exchange.markets and (time.monotonic() - _markets_loaded_at) < MARKETS_REFRESH_SECONDS
+    if fresh and not force:
+        return
+    if _markets_lock is None:
+        _markets_lock = asyncio.Lock()
+    async with _markets_lock:
+        fresh = exchange.markets and (time.monotonic() - _markets_loaded_at) < MARKETS_REFRESH_SECONDS
+        if fresh and not force:
+            return
+        try:
+            await exchange.load_markets(reload=bool(exchange.markets))
+            _markets_loaded_at = time.monotonic()
+        except Exception:
+            if not exchange.markets:
+                raise
+            logger.warning("تازه‌سازی لیست بازارها ناموفق بود؛ لیست قبلی استفاده می‌شود.", exc_info=True)
+            _markets_loaded_at = time.monotonic() - MARKETS_REFRESH_SECONDS + 300  # ۵ دقیقه بعد دوباره تلاش
+
+
+async def close_shared_exchange():
+    """فقط هنگام خاموش‌شدن ربات صدا زده شود."""
+    global _shared_exchange
+    if _shared_exchange is not None:
+        try:
+            await _shared_exchange.close()
+        finally:
+            _shared_exchange = None
+
 
 class ExchangeClient:
+    """
+    پوستهٔ سبک روی نمونهٔ مشترک ccxt. ساختن آن هزینه‌ای ندارد و close()
+    عمداً کاری نمی‌کند تا کدهای قبلی (try/finally: await client.close())
+    بدون تغییر کار کنند. اتصال واقعی در close_shared_exchange بسته می‌شود.
+    """
+
     def __init__(self):
-        exchange_class = getattr(ccxt, EXCHANGE_ID)
-        self.exchange = exchange_class({"enableRateLimit": True})
+        self.exchange = _get_shared_exchange()
 
     async def close(self):
-        await self.exchange.close()
+        return None
 
     async def fetch_ohlcv_df(self, symbol: str, timeframe: str, limit: int = 100) -> pd.DataFrame:
         """
@@ -32,16 +92,15 @@ class ExchangeClient:
         return ticker["last"]
 
     async def validate_symbol(self, symbol: str) -> bool:
-        """چک می‌کنه که نماد روی صرافی وجود داره یا نه"""
+        """چک می‌کنه که نماد روی صرافی وجود داره یا نه (از لیست کش‌شدهٔ بازارها)"""
         try:
-            if not self.exchange.markets:
-                await self.exchange.load_markets()
+            await ensure_markets_loaded()
             return symbol in self.exchange.markets
         except Exception:
             return False
 
     async def load_markets(self):
-        await self.exchange.load_markets()
+        await ensure_markets_loaded(force=True)
 
     async def fetch_top_movers(self, top_n: int = 5, min_quote_volume: float = 3_000_000) -> dict:
         """

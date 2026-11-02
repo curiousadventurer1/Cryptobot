@@ -14,6 +14,7 @@ from config import (
     WEB_PANEL_ENABLED, WEB_PANEL_PORT, ADMIN_IDS, BACKUP_INTERVAL_SECONDS,
 )
 import database as db
+from exchange import close_shared_exchange
 from scheduler import scan_job, check_signal_performance_job, backup_job, news_auto_job
 from handlers.basic import start, help_command
 from handlers.analysis import signal_command, chart_command, price_command, top_command, gainers_command
@@ -36,6 +37,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# حداکثر تعداد آپدیت‌هایی که هم‌زمان پردازش می‌شن
+CONCURRENT_UPDATES = 32
+
 
 async def block_check_handler(update: Update, context):
     """
@@ -53,7 +57,10 @@ async def block_check_handler(update: Update, context):
 
     await db.add_user(user.id, user.username or user.first_name or str(user.id))
 
-    if await db.is_user_blocked(user.id):
+    # یک کوئری برای مسدودی + حالت دسترسی + لیست سفید (به‌جای سه اتصال جدا)
+    access = await db.get_access_snapshot(user.id)
+
+    if access["blocked"]:
         if update.message:
             await update.message.reply_text("🚫 دسترسی شما به این ربات مسدود شده است.")
         elif update.callback_query:
@@ -61,10 +68,10 @@ async def block_check_handler(update: Update, context):
         raise ApplicationHandlerStop
 
     is_admin = user.id in ADMIN_IDS
-    access_mode = await db.get_setting("access_mode", "open")
+    access_mode = access["access_mode"]
     if access_mode == "whitelist" and not is_admin:
         is_command_start = bool(update.message and update.message.text and update.message.text.startswith("/start"))
-        user_whitelisted = await db.is_whitelisted(user.id)
+        user_whitelisted = access["whitelisted"]
 
         if is_command_start and not user_whitelisted:
             # کاربر تازه داره درخواست دسترسی می‌ده - فقط بار اول به
@@ -87,7 +94,9 @@ def build_application() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN تنظیم نشده! فایل .env رو بساز و توکن رو بذار توش.")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # concurrent_updates: آپدیت‌های کاربران مختلف موازی پردازش می‌شن؛ یه
+    # /backtest یا /signal سنگین دیگه بقیه‌ی کاربرها رو پشت صف نگه نمی‌داره.
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(CONCURRENT_UPDATES).build()
 
     # گروه -1 یعنی قبل از همه‌ی هندلرهای دیگه اجرا بشه
     app.add_handler(TypeHandler(Update, block_check_handler), group=-1)
@@ -163,6 +172,7 @@ async def run_bot_only(app: Application):
         finally:
             await app.updater.stop()
             await app.stop()
+            await close_shared_exchange()
 
 
 async def run_bot_and_web(app: Application):
@@ -183,6 +193,7 @@ async def run_bot_and_web(app: Application):
         finally:
             await app.updater.stop()
             await app.stop()
+            await close_shared_exchange()
 
 
 async def main_async():

@@ -5,6 +5,7 @@
 تعیین‌کننده‌ی سیگنال نهاییه. این کار باعث می‌شه سیگنال‌های هم‌جهت در چند
 تایم‌فریم اعتبار بیشتری بگیرن (Confluence).
 """
+import asyncio
 from dataclasses import dataclass, field
 import pandas as pd
 from config import (
@@ -126,11 +127,20 @@ async def analyze_symbol(client: ExchangeClient, symbol: str) -> SignalResult:
     max_possible = 0
     last_close = 0.0
 
-    for tf, cfg in TIMEFRAMES.items():
-        weight = cfg["weight"]
-        candles = cfg["candles"]
+    # دریافت هم‌زمان همهٔ تایم‌فریم‌ها + تیکر (به‌جای پشت‌سرهم)
+    items = list(TIMEFRAMES.items())
+    fetched = await asyncio.gather(
+        *(client.fetch_ohlcv_df(symbol, tf, limit=cfg["candles"]) for tf, cfg in items),
+        client.exchange.fetch_ticker(symbol),
+        return_exceptions=True,
+    )
+    ticker = fetched[-1]
+    for tf_df in fetched[:-1]:
+        if isinstance(tf_df, BaseException):
+            raise tf_df
 
-        df = await client.fetch_ohlcv_df(symbol, tf, limit=candles)
+    for (tf, cfg), df in zip(items, fetched[:-1]):
+        weight = cfg["weight"]
         df = add_indicators(df)
         last_row = df.iloc[-1]
         last_close = float(last_row["close"])
@@ -167,7 +177,8 @@ async def analyze_symbol(client: ExchangeClient, symbol: str) -> SignalResult:
     quote_volume_24h = 0.0
     price_change_pct = 0.0
     try:
-        ticker = await client.exchange.fetch_ticker(symbol)
+        if isinstance(ticker, BaseException):
+            raise ticker
         quote_volume_24h = float(ticker.get("quoteVolume") or 0.0)
         price_change_pct = float(ticker.get("percentage") or 0.0)
     except Exception:

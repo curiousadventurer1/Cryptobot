@@ -221,3 +221,23 @@ def generate_backtest_chart(trades: list, symbol: str, timeframe: str) -> io.Byt
     plt.close(fig)
     buf.seek(0)
     return buf
+
+
+# ---------- اجرای غیرمسدودکننده (برای event loop ربات) ----------
+# pyplot حالت سراسری دارد و thread-safe نیست؛ پس همهٔ رسم‌ها روی یک
+# ترد اختصاصی و پشت‌سرهم اجرا می‌شوند، ولی event loop آزاد می‌ماند.
+import asyncio as _asyncio
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+from functools import partial as _partial
+
+_CHART_EXECUTOR = _ThreadPoolExecutor(max_workers=1, thread_name_prefix="chart")
+
+
+async def generate_extended_chart_async(*args, **kwargs) -> io.BytesIO:
+    loop = _asyncio.get_running_loop()
+    return await loop.run_in_executor(_CHART_EXECUTOR, _partial(generate_extended_chart, *args, **kwargs))
+
+
+async def generate_backtest_chart_async(*args, **kwargs) -> io.BytesIO:
+    loop = _asyncio.get_running_loop()
+    return await loop.run_in_executor(_CHART_EXECUTOR, _partial(generate_backtest_chart, *args, **kwargs))
