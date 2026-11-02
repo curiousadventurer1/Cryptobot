@@ -3,3 +3,11 @@ __pycache__/
 *.pyc
 .env
 bot_database.db
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+backups/
+*.sqlite3
+.venv/
+.DS_Store

@@ -9,9 +9,19 @@ barash misaze (chon az env variable makhsoos PORT estefade mikonim).
 هرکسی که آدرس ربات رو پیدا کنه می‌تونه تنظیماتت رو عوض کنه یا کاربر
 مسدود/رفع‌مسدود کنه.
 """
+import asyncio
+import hashlib
+import hmac
+import logging
+import re
 import secrets
+import time
+from collections import defaultdict, deque
+from html import escape as _html_escape
+from urllib.parse import quote
+
 import httpx
-from fastapi import FastAPI, Depends, HTTPException, status, Form
+from fastapi import FastAPI, Depends, HTTPException, status, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
@@ -19,26 +29,130 @@ import database as db
 import backup
 from config import WEB_PANEL_USERNAME, WEB_PANEL_PASSWORD, BOT_TOKEN
 
-app = FastAPI(title="پنل مدیریت ربات سیگنال")
+logger = logging.getLogger(__name__)
+
+# مستندات خودکار FastAPI (/docs، /redoc، /openapi.json) بدون احراز هویت در
+# دسترس بودن و لیست کامل endpointها رو لو می‌دادن - خاموششون می‌کنیم.
+app = FastAPI(title="پنل مدیریت ربات سیگنال", docs_url=None, redoc_url=None, openapi_url=None)
 security = HTTPBasic()
 
+if WEB_PANEL_PASSWORD and len(WEB_PANEL_PASSWORD) < 12:
+    logger.warning("WEB_PANEL_PASSWORD کوتاهه (کمتر از ۱۲ کاراکتر) - یه رمز طولانی و تصادفی بذار.")
 
-def verify_auth(credentials: HTTPBasicCredentials = Depends(security)) -> str:
+
+def h(value) -> str:
+    """Escape برای هر مقدار متغیری که داخل HTML گذاشته می‌شه (جلوگیری از XSS)"""
+    return _html_escape("" if value is None else str(value), quote=True)
+
+
+# ---------- محدودیت تلاش ناموفق ورود (جلوگیری از brute-force) ----------
+
+LOGIN_MAX_FAILURES = 10          # حداکثر تلاش ناموفق
+LOGIN_WINDOW_SECONDS = 15 * 60   # در این بازه‌ی زمانی، برای هر IP
+_failed_logins: dict[str, deque] = defaultdict(deque)
+
+
+def _client_key(request: Request) -> str:
+    # پشت پروکسی Railway، IP واقعی آخرین مقدار X-Forwarded-For هست
+    # (مقدارهای قبلی رو خود کلاینت می‌تونه جعل کنه)
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[-1].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _recent_failures(key: str) -> deque:
+    q = _failed_logins[key]
+    cutoff = time.monotonic() - LOGIN_WINDOW_SECONDS
+    while q and q[0] < cutoff:
+        q.popleft()
+    if not q:
+        _failed_logins.pop(key, None)
+        q = _failed_logins[key]
+    return q
+
+
+async def verify_auth(request: Request, credentials: HTTPBasicCredentials = Depends(security)) -> str:
     if not WEB_PANEL_PASSWORD:
         # اگه رمز تنظیم نشده، پنل رو کلاً غیرفعال می‌کنیم (امن‌تر از پسورد خالی)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="پنل وب فعال نیست چون WEB_PANEL_PASSWORD تنظیم نشده."
         )
-    correct_user = secrets.compare_digest(credentials.username, WEB_PANEL_USERNAME)
-    correct_pass = secrets.compare_digest(credentials.password, WEB_PANEL_PASSWORD)
+
+    key = _client_key(request)
+    failures = _recent_failures(key)
+    if len(failures) >= LOGIN_MAX_FAILURES:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="تلاش ناموفق زیاد بود. چند دقیقه بعد دوباره امتحان کن.",
+        )
+
+    # مقایسه روی bytes: compare_digest با رشته‌ی غیر ASCII خطا می‌ده (500)
+    correct_user = secrets.compare_digest(credentials.username.encode("utf-8"), WEB_PANEL_USERNAME.encode("utf-8"))
+    correct_pass = secrets.compare_digest(credentials.password.encode("utf-8"), WEB_PANEL_PASSWORD.encode("utf-8"))
     if not (correct_user and correct_pass):
+        failures.append(time.monotonic())
+        if len(_failed_logins) > 10_000:  # سقف حافظه
+            _failed_logins.clear()
+        logger.warning("ورود ناموفق به پنل وب از %s", key)
+        await asyncio.sleep(0.5)  # کند کردن حدس‌زدن رمز
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="نام کاربری یا رمز اشتباهه",
             headers={"WWW-Authenticate": "Basic"},
         )
     return credentials.username
+
+
+# ---------- محافظت CSRF ----------
+# Basic Auth رو مرورگر خودکار روی هر درخواستی می‌فرسته، حتی اگه از یه سایت
+# دیگه فرستاده شده باشه. بدون توکن CSRF، هر سایتی که ادمین بازش کنه
+# می‌تونست بی‌صدا پیام همگانی بفرسته یا تنظیمات/مسدودی‌ها رو عوض کنه.
+# توکن با یه کلید تصادفیِ هر بار اجرا ساخته می‌شه (بعد از ری‌استارت،
+# صفحه‌ی باز رو یه بار رفرش کن).
+
+_CSRF_SECRET = secrets.token_bytes(32)
+
+
+def _csrf_token(username: str) -> str:
+    return hmac.new(_CSRF_SECRET, username.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+async def verify_post(request: Request, csrf_token: str = Form(""), user: str = Depends(verify_auth)) -> str:
+    """برای همه‌ی درخواست‌های POST: احراز هویت + بررسی منشأ + توکن CSRF"""
+    fetch_site = request.headers.get("sec-fetch-site")
+    if fetch_site and fetch_site not in ("same-origin", "none"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="درخواست از سایت دیگه پذیرفته نمی‌شه.")
+    if not hmac.compare_digest(csrf_token.encode("utf-8"), _csrf_token(user).encode("utf-8")):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="توکن امنیتی فرم نامعتبره. صفحه رو رفرش کن و دوباره امتحان کن.",
+        )
+    return user
+
+
+_POST_FORM_RE = re.compile(r"(<form\b[^>]*\bmethod=['\"]post['\"][^>]*>)", re.IGNORECASE)
+
+
+def _add_csrf_fields(body: str, user: str) -> str:
+    field = f"<input type='hidden' name='csrf_token' value='{_csrf_token(user)}'>"
+    return _POST_FORM_RE.sub(lambda m: m.group(1) + field, body)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; "
+        "form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    )
+    response.headers.setdefault("Cache-Control", "no-store")
+    return response
 
 
 PAGE_STYLE = """
@@ -63,10 +177,11 @@ PAGE_STYLE = """
 """
 
 
-def layout(title: str, body: str) -> str:
+def layout(title: str, body: str, user: str) -> str:
+    body = _add_csrf_fields(body, user)
     return f"""<!DOCTYPE html>
 <html lang="fa"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} — پنل ربات</title>{PAGE_STYLE}</head>
+<title>{h(title)} — پنل ربات</title>{PAGE_STYLE}</head>
 <body><div class="container">
 <h1>🤖 پنل مدیریت ربات سیگنال</h1>
 <div>
@@ -102,7 +217,7 @@ async def dashboard(user: str = Depends(verify_auth)):
       بلافاصله (بدون نیاز به ری‌استارت یا ری‌دیپلوی) روی ربات اعمال می‌شه.
     </div>
     """
-    return layout("داشبورد", body)
+    return layout("داشبورد", body, user)
 
 
 PAGE_SIZE = 20
@@ -122,19 +237,20 @@ async def users_page(user: str = Depends(verify_auth), page: int = 1):
             badges += "<span style='color:#ef4444'>🚫 مسدود</span> "
         if u["is_whitelisted"]:
             badges += "<span style='color:#22c55e'>✅ لیست‌سفید</span>"
-        uname = u["username"] or "بدون‌نام"
+        uname = h(u["username"] or "بدون‌نام")
+        uid = h(u["user_id"])
 
         if u["is_whitelisted"]:
             wl_form = f"""<form method='post' action='/users/unwhitelist' style='margin:0'>
-                <input type='hidden' name='user_id' value='{u["user_id"]}'>
+                <input type='hidden' name='user_id' value='{uid}'>
                 <button class='danger' type='submit'>حذف از لیست سفید</button></form>"""
         else:
             wl_form = f"""<form method='post' action='/users/whitelist' style='margin:0'>
-                <input type='hidden' name='user_id' value='{u["user_id"]}'>
+                <input type='hidden' name='user_id' value='{uid}'>
                 <button type='submit'>افزودن به لیست سفید</button></form>"""
 
         rows += (
-            f"<tr><td>{u['user_id']}</td><td>{uname}</td><td>{u['joined_at'][:10]}</td>"
+            f"<tr><td>{uid}</td><td>{uname}</td><td>{h((u['joined_at'] or '')[:10])}</td>"
             f"<td>{badges or '-'}</td><td>{wl_form}</td></tr>"
         )
 
@@ -156,11 +272,11 @@ async def users_page(user: str = Depends(verify_auth), page: int = 1):
       <div style="margin-top:12px">{nav}</div>
     </div>
     """
-    return layout("کاربران", body)
+    return layout("کاربران", body, user)
 
 
 @app.post("/users/whitelist")
-async def whitelist_user_web(user_id: str = Form(...), user: str = Depends(verify_auth)):
+async def whitelist_user_web(user_id: str = Form(...), user: str = Depends(verify_post)):
     cleaned = user_id.strip()
     if cleaned.lstrip("-").isdigit():
         await db.add_to_whitelist(int(cleaned), "از پنل وب")
@@ -168,7 +284,7 @@ async def whitelist_user_web(user_id: str = Form(...), user: str = Depends(verif
 
 
 @app.post("/users/unwhitelist")
-async def unwhitelist_user_web(user_id: str = Form(...), user: str = Depends(verify_auth)):
+async def unwhitelist_user_web(user_id: str = Form(...), user: str = Depends(verify_post)):
     cleaned = user_id.strip()
     if cleaned.lstrip("-").isdigit():
         await db.remove_from_whitelist(int(cleaned))
@@ -179,9 +295,9 @@ async def unwhitelist_user_web(user_id: str = Form(...), user: str = Depends(ver
 async def blocked_page(user: str = Depends(verify_auth)):
     blocked = await db.get_blocked_users()
     rows = "".join(
-        f"<tr><td>{b['user_id']}</td><td>{b['reason']}</td><td>{b['blocked_at'][:10]}</td>"
+        f"<tr><td>{h(b['user_id'])}</td><td>{h(b['reason'])}</td><td>{h((b['blocked_at'] or '')[:10])}</td>"
         f"<td><form method='post' action='/blocked/unblock' style='margin:0'>"
-        f"<input type='hidden' name='user_id' value='{b['user_id']}'>"
+        f"<input type='hidden' name='user_id' value='{h(b['user_id'])}'>"
         f"<button class='danger' type='submit'>رفع مسدودی</button></form></td></tr>"
         for b in blocked
     )
@@ -203,11 +319,11 @@ async def blocked_page(user: str = Depends(verify_auth)):
       <table><tr><th>شناسه</th><th>دلیل</th><th>تاریخ</th><th></th></tr>{rows}</table>
     </div>
     """
-    return layout("کاربران مسدود", body)
+    return layout("کاربران مسدود", body, user)
 
 
 @app.post("/blocked/block")
-async def block_user_web(user_id: str = Form(...), reason: str = Form(""), user: str = Depends(verify_auth)):
+async def block_user_web(user_id: str = Form(...), reason: str = Form(""), user: str = Depends(verify_post)):
     cleaned = user_id.strip()
     if cleaned.lstrip("-").isdigit():
         await db.block_user(int(cleaned), reason.strip() or "بدون دلیل ثبت‌شده (از پنل وب)")
@@ -215,7 +331,7 @@ async def block_user_web(user_id: str = Form(...), reason: str = Form(""), user:
 
 
 @app.post("/blocked/unblock")
-async def unblock_user_web(user_id: str = Form(...), user: str = Depends(verify_auth)):
+async def unblock_user_web(user_id: str = Form(...), user: str = Depends(verify_post)):
     cleaned = user_id.strip()
     if cleaned.lstrip("-").isdigit():
         await db.unblock_user(int(cleaned))
@@ -240,8 +356,8 @@ async def backups_page(user: str = Depends(verify_auth)):
         size_str = f"{b['size_kb']:.1f} KB" if b["size_kb"] < 1024 else f"{b['size_kb']/1024:.1f} MB"
         date_str = b["created_at"].strftime("%Y-%m-%d %H:%M")
         rows += (
-            f"<tr><td>{b['filename']}</td><td>{size_str}</td><td>{date_str}</td>"
-            f"<td><a class='nav' href='/backups/download/{b['filename']}'>⬇️ دانلود</a></td></tr>"
+            f"<tr><td>{h(b['filename'])}</td><td>{size_str}</td><td>{date_str}</td>"
+            f"<td><a class='nav' href='/backups/download/{h(quote(b['filename']))}'>⬇️ دانلود</a></td></tr>"
         )
     if not rows:
         rows = "<tr><td colspan='4' class='hint'>هنوز هیچ بکاپی ساخته نشده.</td></tr>"
@@ -259,11 +375,11 @@ async def backups_page(user: str = Depends(verify_auth)):
       <table><tr><th>فایل</th><th>حجم</th><th>تاریخ</th><th></th></tr>{rows}</table>
     </div>
     """
-    return layout("بکاپ‌ها", body)
+    return layout("بکاپ‌ها", body, user)
 
 
 @app.post("/backups/create")
-async def create_backup_web(user: str = Depends(verify_auth)):
+async def create_backup_web(user: str = Depends(verify_post)):
     try:
         await backup.create_backup()
     except Exception:
@@ -280,9 +396,13 @@ async def download_backup_web(filename: str, user: str = Depends(verify_auth)):
 
 
 @app.get("/settings", response_class=HTMLResponse)
-async def settings_page(user: str = Depends(verify_auth)):
+async def settings_page(user: str = Depends(verify_auth), error: str = ""):
     current = await db.get_all_settings()
     forms = ""
+    labels = {k: label for k, label, _, _ in SETTINGS_SCHEMA}
+    if error in labels:
+        forms += (f"<p style='color:#ef4444'>❌ مقدار «{h(labels[error])}» نامعتبر بود و ذخیره نشد. "
+                  f"راهنمای زیر هر فیلد رو ببین.</p>")
     for key, label, default, hint in SETTINGS_SCHEMA:
         value = current.get(key, default)
         forms += f"""
@@ -291,7 +411,7 @@ async def settings_page(user: str = Depends(verify_auth)):
           <p class="hint">{hint}</p>
           <form method="post" action="/settings/update" style="display:flex; gap:8px; align-items:center;">
             <input name="key" value="{key}" type="hidden">
-            <input name="value" value="{value}" style="margin-bottom:0;">
+            <input name="value" value="{h(value)}" style="margin-bottom:0;">
             <button type="submit">ذخیره</button>
           </form>
         </div>
@@ -323,7 +443,7 @@ async def settings_page(user: str = Depends(verify_auth)):
       <h3>👋 پیام خوش‌آمدگویی سفارشی</h3>
       <p class="hint">این پیام، قبل از راهنمای استاندارد، به هر کسی که /start بزنه نشون داده می‌شه.</p>
       <form method="post" action="/settings/welcome">
-        <textarea name="message" rows="3" placeholder="مثلاً: به کانال ما هم سر بزن...">{welcome_msg}</textarea>
+        <textarea name="message" rows="3" placeholder="مثلاً: به کانال ما هم سر بزن...">{h(welcome_msg)}</textarea>
         <button type="submit">ذخیره پیام</button>
       </form>
       <form method="post" action="/settings/welcome/delete" style="margin-top:8px">
@@ -337,32 +457,63 @@ async def settings_page(user: str = Depends(verify_auth)):
       {forms}
     </div>
     """
-    return layout("تنظیمات", body)
+    return layout("تنظیمات", body, user)
+
+
+def _validate_setting(key: str, raw: str) -> str | None:
+    """
+    مقدار تنظیمات موتور رو اعتبارسنجی و نرمال می‌کنه؛ اگه نامعتبر باشه None.
+    (قبلاً هر متنی ذخیره می‌شد - مثلاً nan یا عدد منفی - و موتور سیگنال رو خراب می‌کرد)
+    """
+    import math
+    raw = raw.strip()
+    try:
+        if key == "max_watchlist_per_user":
+            v = int(raw)
+            return str(v) if 1 <= v <= 500 else None
+        if key == "confidence_threshold_fraction":
+            v = float(raw)
+            return str(v) if math.isfinite(v) and 0 < v < 1 else None
+        if key == "atr_sl_mult":
+            v = float(raw)
+            return str(v) if math.isfinite(v) and 0.1 <= v <= 10 else None
+        if key == "rr_targets":
+            parts = [float(x) for x in raw.split(",")]
+            if (len(parts) == 3 and all(math.isfinite(x) and 0 < x <= 20 for x in parts)
+                    and parts[0] < parts[1] < parts[2]):
+                return ",".join(f"{x:g}" for x in parts)
+            return None
+    except ValueError:
+        return None
+    return None
 
 
 @app.post("/settings/update")
-async def update_setting_web(key: str = Form(...), value: str = Form(...), user: str = Depends(verify_auth)):
+async def update_setting_web(key: str = Form(...), value: str = Form(...), user: str = Depends(verify_post)):
     valid_keys = {k for k, _, _, _ in SETTINGS_SCHEMA}
     if key in valid_keys:
-        await db.set_setting(key, value.strip())
+        cleaned = _validate_setting(key, value)
+        if cleaned is None:
+            return RedirectResponse(f"/settings?error={quote(key)}", status_code=303)
+        await db.set_setting(key, cleaned)
     return RedirectResponse("/settings", status_code=303)
 
 
 @app.post("/settings/access-mode")
-async def update_access_mode_web(mode: str = Form(...), user: str = Depends(verify_auth)):
+async def update_access_mode_web(mode: str = Form(...), user: str = Depends(verify_post)):
     if mode in ("open", "whitelist"):
         await db.set_setting("access_mode", mode)
     return RedirectResponse("/settings", status_code=303)
 
 
 @app.post("/settings/welcome")
-async def update_welcome_web(message: str = Form(...), user: str = Depends(verify_auth)):
+async def update_welcome_web(message: str = Form(...), user: str = Depends(verify_post)):
     await db.set_setting("custom_welcome_message", message.strip())
     return RedirectResponse("/settings", status_code=303)
 
 
 @app.post("/settings/welcome/delete")
-async def delete_welcome_web(user: str = Depends(verify_auth)):
+async def delete_welcome_web(user: str = Depends(verify_post)):
     await db.set_setting("custom_welcome_message", "")
     return RedirectResponse("/settings", status_code=303)
 
@@ -380,11 +531,11 @@ async def broadcast_page(user: str = Depends(verify_auth)):
       </form>
     </div>
     """
-    return layout("پیام همگانی", body)
+    return layout("پیام همگانی", body, user)
 
 
 @app.post("/broadcast/send", response_class=HTMLResponse)
-async def send_broadcast_web(message: str = Form(...), user: str = Depends(verify_auth)):
+async def send_broadcast_web(message: str = Form(...), user: str = Depends(verify_post)):
     user_ids = await db.get_all_user_ids()
     sent, failed = 0, 0
     async with httpx.AsyncClient(timeout=10) as client:
@@ -400,6 +551,7 @@ async def send_broadcast_web(message: str = Form(...), user: str = Depends(verif
                     failed += 1
             except Exception:
                 failed += 1
+            await asyncio.sleep(0.05)  # رعایت محدودیت نرخ ارسال تلگرام
 
     body = f"""
     <div class="card">
@@ -407,4 +559,4 @@ async def send_broadcast_web(message: str = Form(...), user: str = Depends(verif
       <br><br><a class="nav" href="/broadcast">بازگشت</a>
     </div>
     """
-    return layout("پیام همگانی", body)
+    return layout("پیام همگانی", body, user)
