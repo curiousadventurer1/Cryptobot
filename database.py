@@ -123,7 +123,9 @@ async def init_db():
         cursor = await db.execute("PRAGMA table_info(signal_performance)")
         columns = {row[1] for row in await cursor.fetchall()}
         for name, sql_type in (
-            ("entry_triggered_at", "TEXT"), ("entry_observed_price", "REAL")
+            ("entry_triggered_at", "TEXT"), ("entry_observed_price", "REAL"),
+            # فاز ۳: ریسک اولیه (sl بعد از TP1 بازنویسی می‌شه) و نشانگر پایش کندلی
+            ("initial_sl", "REAL"), ("monitor_cursor_ms", "INTEGER"),
         ):
             if name not in columns:
                 await db.execute(f"ALTER TABLE signal_performance ADD COLUMN {name} {sql_type}")
@@ -151,6 +153,12 @@ async def init_db():
                 value TEXT
             )
         """)
+        # فاز ۳: تاریخچه‌ی عملکرد فقط از زمان این به‌روزرسانی (پایش قبلی لمس‌های
+        # بین دو بررسی رو جا می‌انداخت). فقط بار اول ثبت می‌شه؛ از پنل وب قابل تغییره.
+        await db.execute(
+            "INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('history_v2_since', ?)",
+            (datetime.utcnow().isoformat(),)
+        )
         await db.execute("""
             CREATE TABLE IF NOT EXISTS user_news_settings (
                 user_id INTEGER PRIMARY KEY,
@@ -653,11 +661,14 @@ async def _insert_signal_performance(connection, user_id: int, symbol: str, time
     """درج بدون commit؛ مالک تراکنش، ثبت و rollback را کنترل می‌کند."""
     entry, sl, targets = validate_trade_geometry(direction, entry, sl, tps)
     tp1, tp2, tp3 = targets
+    now = datetime.utcnow()
     cursor = await connection.execute(
         """INSERT INTO signal_performance
-           (user_id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'WAITING_ENTRY', ?)""",
-        (user_id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3, datetime.utcnow().isoformat())
+           (user_id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3, status, created_at,
+            initial_sl, monitor_cursor_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'WAITING_ENTRY', ?, ?, ?)""",
+        (user_id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3, now.isoformat(),
+         sl, int(now.replace(tzinfo=timezone.utc).timestamp() * 1000))
     )
     return cursor.lastrowid
 
@@ -1369,3 +1380,44 @@ async def get_users_with_news_auto() -> list[int]:
         cursor = await db.execute("SELECT user_id FROM user_news_settings WHERE auto_enabled = 1")
         rows = await cursor.fetchall()
         return [r[0] for r in rows]
+
+
+# ==================== فاز ۳: پایش کندلی و تاریخچه‌ی R ====================
+
+async def get_monitor_cursors(perf_ids: list) -> dict:
+    """{perf_id: monitor_cursor_ms یا None} - None یعنی رکورد قدیمی (قبل از فاز ۳)"""
+    if not perf_ids:
+        return {}
+    placeholders = ",".join("?" for _ in perf_ids)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            f"SELECT id, monitor_cursor_ms FROM signal_performance WHERE id IN ({placeholders})",
+            list(perf_ids)
+        )
+        return {row[0]: row[1] for row in await cursor.fetchall()}
+
+
+async def set_monitor_cursor(perf_id: int, cursor_ms: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE signal_performance SET monitor_cursor_ms = ? WHERE id = ?",
+            (int(cursor_ms), perf_id)
+        )
+        await db.commit()
+
+
+async def get_resolved_signal_details_for(symbol: str, timeframe: str, direction: str,
+                                          since: str | None = None) -> list[dict]:
+    """سیگنال‌های به‌نتیجه‌رسیده با قیمت‌ها (برای محاسبه‌ی R)؛ قدیمی‌ترین اول"""
+    query = """SELECT status, entry, sl, initial_sl, tp1, tp3, created_at FROM signal_performance
+               WHERE symbol = ? AND timeframe = ? AND direction = ?
+               AND status IN ('TP3_HIT', 'SL_HIT', 'BREAKEVEN_HIT')"""
+    params = [symbol, timeframe, direction]
+    if since:
+        query += " AND created_at >= ?"
+        params.append(since)
+    query += " ORDER BY id ASC"
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(query, params)
+        cols = ["status", "entry", "sl", "initial_sl", "tp1", "tp3", "created_at"]
+        return [dict(zip(cols, r)) for r in await cursor.fetchall()]

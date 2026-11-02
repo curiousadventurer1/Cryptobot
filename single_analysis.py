@@ -531,6 +531,12 @@ class SingleTFResult:
     volatility_risk_mult: float = 1.0
     support: float = None
     resistance: float = None
+    # --- فاز ۳: امتیازدهی سایه (مدل دیگه، فقط برای مقایسه/لاگ) و هزینه‌ی معامله ---
+    scoring_mode: str = "classic"
+    shadow: dict | None = None
+    cost_r: float | None = None          # هزینه‌ی تقریبی رفت‌وبرگشت (کارمزد+لغزش) بر حسب R
+    cost_filtered: bool = False          # سیگنال به‌خاطر هزینه‌ی بالا خنثی شد
+    closed_candle_basis: bool = False    # رأی‌ها روی آخرین کندل بسته‌شده حساب شدن
     # --- فاز ۱ تقویت موتور: نتیجه‌ی هم‌نوایی زمینه‌ای ---
     context_adjusted_confidence_percent: int = None
     context_notes: list = field(default_factory=list)
@@ -554,17 +560,140 @@ def _classify_liquidity(quote_volume_24h: float) -> str:
     return "پایین 🔴 (ریسک اسپرد/لغزش قیمت بیشتر)"
 
 
+def estimate_cost_r(entry: float, risk: float, fee_rate: float, slippage: float) -> float:
+    """
+    هزینه‌ی تقریبی یه معامله‌ی کامل بر حسب R: کارمزد ورود + کارمزد خروج +
+    لغزش خروج بازار (SL). fee_rate و slippage کسر هستن (0.001 = 0.1%).
+    """
+    if not risk or risk <= 0:
+        return 0.0
+    return abs(entry) * (2 * max(fee_rate, 0.0) + max(slippage, 0.0)) / abs(risk)
+
+
+def _direction_from_score(score: float, threshold: float) -> str:
+    if score >= threshold:
+        return "BUY"
+    if score <= -threshold:
+        return "SELL"
+    return "NEUTRAL"
+
+
+TREND_BLOCK_WEIGHT = 3.0  # سقف وزن کل اندیکاتورهای روندیِ هم‌بسته در مدل «بلوک روند»
+
+
+def _trend_block_votes(df, last, price, adx_val, rsi_val, pattern,
+                       divergence, macd_divergence, obv_divergence):
+    """
+    مدل امتیازدهی «بلوک روند» (فاز ۳):
+    - EMA12/26، قیمت/EMA50، SMA20/50، MACD/سیگنال و شیب هیستوگرام MACD همه
+      یه چیز رو می‌سنجن (جهت روند)؛ به‌جای ۷ امتیاز جدا، میانگینشون یه رأی
+      با سقف TREND_BLOCK_WEIGHT می‌شه (با ضریب ADX مثل قبل).
+    - RSI وابسته به رژیم: در روند قوی مومنتوم (≥55 صعودی)، در بازار رنج
+      برگشتی (≥70 اشباع خرید = نزولی، ≤30 اشباع فروش = صعودی).
+    - بقیه‌ی رأی‌ها (OBV، بولینگر، حجم، الگو، واگرایی‌ها) مثل مدل فعلی.
+    خروجی: (score, max_score, votes) - votes با همون قالب مدل فعلی برای متن دلایل.
+    """
+    from config import ADX_TREND_THRESHOLD, ADX_RANGE_THRESHOLD, ADX_MEANREV_WEIGHT_BOOST
+
+    score = 0.0
+    max_score = 0.0
+    votes = []
+
+    def add(weight, is_bull, bull_text, bear_text, category="unique"):
+        nonlocal score, max_score
+        max_score += weight
+        score += weight if is_bull else -weight
+        votes.append((weight, is_bull, bull_text, bear_text, category))
+
+    components = [bool(last["ema12"] > last["ema26"]), bool(last["sma20"] > last["sma50"]),
+                  bool(last["macd"] > last["macd_signal"])]
+    if not pd.isna(last["ema50"]):
+        components.append(bool(price > last["ema50"]))
+    if len(df) >= 4 and not df["macd_hist"].iloc[-3:].isna().any():
+        components.append(bool(df["macd_hist"].iloc[-1] > df["macd_hist"].iloc[-3]))
+    n_bull = sum(components)
+    n_total = len(components)
+    mean = (2 * n_bull - n_total) / n_total if n_total else 0.0
+    w_trend = _adx_adjusted_weight(TREND_BLOCK_WEIGHT, "trend", adx_val)
+    max_score += w_trend
+    score += w_trend * mean
+    if mean != 0:
+        agree = n_bull if mean > 0 else n_total - n_bull
+        votes.append((w_trend * abs(mean), mean > 0,
+                      f"روند صعودی در {agree} از {n_total} اندیکاتور روندی (EMA/SMA/MACD)",
+                      f"روند نزولی در {agree} از {n_total} اندیکاتور روندی (EMA/SMA/MACD)",
+                      "unique"))
+
+    if len(df) >= 15 and not df["obv"].iloc[-15:].isna().any():
+        add(_adx_adjusted_weight(1, "trend", adx_val), bool(df["obv"].iloc[-1] > df["obv"].iloc[-15]),
+            "روند صعودی OBV (تایید جریان پول خرید)", "روند نزولی OBV (تایید جریان پول فروش)")
+
+    if adx_val >= ADX_TREND_THRESHOLD:
+        if rsi_val >= 55:
+            add(1, True, f"مومنتوم RSI هم‌جهت با روند ({rsi_val:.1f})", "")
+        elif rsi_val <= 45:
+            add(1, False, "", f"مومنتوم RSI هم‌جهت با روند ({rsi_val:.1f})")
+    elif adx_val > 0 and adx_val <= ADX_RANGE_THRESHOLD:
+        if rsi_val >= 70:
+            add(ADX_MEANREV_WEIGHT_BOOST, False, "", f"RSI اشباع خرید در بازار رنج ({rsi_val:.1f})")
+        elif rsi_val <= 30:
+            add(ADX_MEANREV_WEIGHT_BOOST, True, f"RSI اشباع فروش در بازار رنج ({rsi_val:.1f})", "")
+    else:
+        if rsi_val >= 55:
+            add(1, True, f"RSI در ناحیه‌ی صعودی ({rsi_val:.1f})", "")
+        elif rsi_val <= 45:
+            add(1, False, "", f"RSI در ناحیه‌ی نزولی ({rsi_val:.1f})")
+
+    if not pd.isna(last["bb_upper"]) and not pd.isna(last["bb_lower"]):
+        band_width = last["bb_upper"] - last["bb_lower"]
+        if band_width > 0:
+            w = _adx_adjusted_weight(1, "mean_reversion", adx_val)
+            if abs(price - last["bb_lower"]) / band_width < 0.15:
+                add(w, True, "قیمت نزدیک باند پایین بولینگر (اشباع فروش)", "")
+            elif abs(price - last["bb_upper"]) / band_width < 0.15:
+                add(w, False, "", "قیمت نزدیک باند بالای بولینگر (اشباع خرید)")
+
+    if not pd.isna(last["volume_sma"]) and last["volume_sma"] > 0 and len(df) >= 21:
+        if last["volume"] >= last["volume_sma"] * 1.5:
+            add(1, bool(last["close"] > last["open"]),
+                "اسپایک حجم هم‌جهت با کندل صعودی", "اسپایک حجم هم‌جهت با کندل نزولی")
+
+    if pattern and pattern["bias"] != 0:
+        add(1, pattern["bias"] > 0, f"الگوی کندلی: {pattern['name']}", f"الگوی کندلی: {pattern['name']}")
+
+    for div, label in ((divergence, "RSI"), (macd_divergence, "MACD"), (obv_divergence, "OBV")):
+        if div:
+            add(2, div["bias"] > 0,
+                f"🔀 واگرایی صعودی {label}/قیمت (سیگنال بازگشتی قوی)",
+                f"🔀 واگرایی نزولی {label}/قیمت (سیگنال بازگشتی قوی)")
+
+    return score, max_score, votes
+
+
 DEFAULT_CONFIDENCE_THRESHOLD_FRACTION = 0.25  # حداقل فاصله‌ی امتیاز از صفر (نسبت به حداکثر) برای صدور سیگنال قطعی
 
 
 def build_single_result(df: pd.DataFrame, symbol: str, timeframe: str,
                          confidence_threshold_fraction: float = None,
-                         atr_sl_mult: float = None, rr_targets: list = None) -> SingleTFResult:
+                         atr_sl_mult: float = None, rr_targets: list = None,
+                         live_price: float = None, scoring_mode: str = "classic",
+                         fee_rate: float = 0.0, slippage: float = 0.0,
+                         max_cost_r: float = 0.0) -> SingleTFResult:
     """
     df باید خروجی add_extended_indicators باشه (شامل حداقل ۵۰ کندل معتبر)
 
     سه پارامتر آخر اختیاریان و از پنل وب/تنظیمات دیتابیس قابل override
     هستن؛ اگه داده نشن، از مقادیر پیش‌فرض همین فایل استفاده می‌شه.
+
+    فاز ۳ (همه اختیاری؛ پیش‌فرض‌ها = رفتار قبلی):
+    - live_price: وقتی df فقط کندل‌های بسته‌شده رو داره، رأی‌ها روی close
+      آخرین کندل بسته حساب می‌شن (بدون repaint) ولی ورود/SL/TP و قیمت
+      نمایشی از قیمت لحظه‌ای ساخته می‌شن.
+    - scoring_mode: "classic" (فعلی) یا "trend_block" (اندیکاتورهای روندی
+      هم‌بسته یه رأی سقف‌دار می‌شن + منطق RSI وابسته به رژیم بازار).
+      مدل دیگه همیشه به‌صورت سایه (result.shadow) هم حساب می‌شه.
+    - fee_rate/slippage (کسر، نه درصد) و max_cost_r: اگه max_cost_r > 0 و
+      هزینه‌ی رفت‌وبرگشت بیشتر از این کسر از ریسک باشه، سیگنال خنثی می‌شه.
     """
     from config import VOLATILITY_THRESHOLD_HIGH_MULT, VOLATILITY_THRESHOLD_EXTREME_MULT
 
@@ -704,6 +833,21 @@ def build_single_result(df: pd.DataFrame, symbol: str, timeframe: str,
     else:
         direction = "NEUTRAL"
 
+    tb_score, tb_max, tb_votes = _trend_block_votes(
+        df, last, price, adx_val, rsi_val, pattern, divergence, macd_divergence, obv_divergence
+    )
+    tb_direction = _direction_from_score(tb_score, tb_max * effective_threshold_fraction)
+    classic_summary = {"mode": "classic", "score": round(score, 3), "max_score": round(max_score, 3),
+                       "direction": direction}
+    tb_summary = {"mode": "trend_block", "score": round(tb_score, 3), "max_score": round(tb_max, 3),
+                  "direction": tb_direction}
+    if scoring_mode == "trend_block":
+        score, max_score, direction, votes = tb_score, tb_max, tb_direction, tb_votes
+        shadow = classic_summary
+    else:
+        scoring_mode = "classic"
+        shadow = tb_summary
+
     reasons = []
     if direction in ("BUY", "SELL"):
         matching_trend = []
@@ -733,15 +877,36 @@ def build_single_result(df: pd.DataFrame, symbol: str, timeframe: str,
         # دلایل منحصربه‌فرد رو اول لیست می‌ذاریم چون اطلاعات بیشتری دارن
         reasons = matching_unique + reasons
 
+    level_price = price
+    if live_price is not None:
+        try:
+            lp = float(live_price)
+            if np.isfinite(lp) and lp > 0:
+                level_price = lp
+        except (TypeError, ValueError):
+            pass
+    ema12_val = float(last["ema12"]) if not pd.isna(last["ema12"]) else None
+
     levels = _calc_levels(
-        df, price, atr, direction, float(last["ema12"]) if not pd.isna(last["ema12"]) else None,
+        df, level_price, atr, direction, ema12_val,
         atr_sl_mult=atr_sl_mult, rr_targets=rr_targets
     )
+
+    cost_r = None
+    cost_filtered = False
+    if direction in ("BUY", "SELL") and levels["risk"]:
+        cost_r = estimate_cost_r(levels["entry"], levels["risk"], fee_rate, slippage)
+        if max_cost_r and max_cost_r > 0 and cost_r > max_cost_r:
+            cost_filtered = True
+            direction = "NEUTRAL"
+            reasons = [f"💸 هزینه‌ی کارمزد/لغزش ({cost_r:.2f}R) نسبت به فاصله‌ی حد ضرر زیاده؛ سیگنال صادر نشد"]
+            levels = _calc_levels(df, level_price, atr, direction, ema12_val,
+                                  atr_sl_mult=atr_sl_mult, rr_targets=rr_targets)
 
     return SingleTFResult(
         symbol=symbol,
         timeframe=timeframe,
-        price=price,
+        price=level_price,
         rsi=rsi_val,
         macd=float(last["macd"]) if not pd.isna(last["macd"]) else 0.0,
         macd_signal=float(last["macd_signal"]) if not pd.isna(last["macd_signal"]) else 0.0,
@@ -772,6 +937,10 @@ def build_single_result(df: pd.DataFrame, symbol: str, timeframe: str,
         volatility_risk_mult=volatility["risk_mult"],
         support=levels["support"],
         resistance=levels["resistance"],
+        scoring_mode=scoring_mode,
+        shadow=shadow,
+        cost_r=cost_r,
+        cost_filtered=cost_filtered,
     )
 
 
@@ -849,7 +1018,23 @@ def apply_context_confluence(result: SingleTFResult, higher_tf_info: dict = None
             adjustment -= CONTEXT_ORDERBOOK_PENALTY
             notes.append("اردربوک مخالف (فشار خرید)")
 
-    if historical_performance_info:
+    if historical_performance_info and historical_performance_info.get("version") == 2:
+        # فاز ۳: بر پایه‌ی میانگین R (با کشش آماری به سمت صفر برای نمونه‌ی کم)،
+        # نه نرخ برد خام - چون با TP3 = 3R، نقطه‌ی سربه‌سر نرخ برد ۲۵٪ هست نه ۵۰٪
+        from config import HISTORY_POINTS_PER_R
+        shrunk = historical_performance_info["shrunk_r"]
+        raw_mean = historical_performance_info["expectancy_r"]
+        n = historical_performance_info["sample_size"]
+        hist_adj = shrunk * HISTORY_POINTS_PER_R
+        hist_adj = int(round(max(-CONTEXT_HISTORICAL_PERFORMANCE_PENALTY,
+                                 min(CONTEXT_HISTORICAL_PERFORMANCE_BONUS, hist_adj))))
+        if hist_adj > 0:
+            adjustment += hist_adj
+            notes.append(f"عملکرد تاریخی مثبت برای این نوع سیگنال (میانگین {raw_mean:+.2f}R از {n} نمونه)")
+        elif hist_adj < 0:
+            adjustment += hist_adj
+            notes.append(f"عملکرد تاریخی منفی برای این نوع سیگنال (میانگین {raw_mean:+.2f}R از {n} نمونه)")
+    elif historical_performance_info:
         win_rate = historical_performance_info["win_rate"]
         sample_size = historical_performance_info["sample_size"]
         if win_rate >= CONTEXT_HISTORICAL_WIN_RATE_BONUS_THRESHOLD:

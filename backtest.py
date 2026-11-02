@@ -19,12 +19,24 @@ df.iloc[:i+1] استفاده می‌شه، یعنی موتور اصلاً نمی
 فرض محافظه‌کارانه: اگه توی یه کندل، هم SL و هم یه TP لمس بشن (چون از
 روی کندل‌های OHLC نمی‌شه ترتیب دقیق داخل کندل رو فهمید)، SL رو مقدم
 فرض می‌کنیم - یعنی بک‌تست به‌جای خوش‌بینانه، بدبینانه/محافظه‌کارانه‌ست.
+
+** فاز ۳ - مدل هم‌سان با پایش زنده (SimulationSettings.live_model=True) **
+- ورود با سفارش limit روی Entry پیشنهادی (پولبک)، نه open کندل بعد؛ تا
+  max_hold کندل منتظر پر شدن می‌مونه. گپ به آن‌سوی SL قبل از ورود = باطل.
+  اگه open از Entry بهتر بود (گپ)، با open پر می‌شه.
+- توی کندل ورود فقط SL چک می‌شه (ترتیب داخل کندل معلوم نیست).
+- بعد از TP1، SL به نقطه‌ی ورود منتقل می‌شه (مثل BREAKEVEN_AFTER_TP1 پایش).
+- خروج فقط TP3، SL، سربه‌سر یا پایان دوره (با close)؛ دیگه «تا TP2 رسید»
+  به‌عنوان ۲R کامل ثبت نمی‌شه، چون پوزیشن واقعی هنوز باز بوده.
+- کارمزد هر طرف + لغزش خروج‌های بازار (SL/سربه‌سر/timeout) از R کم می‌شه.
+- برد/باخت مثل /mystats: سربه‌سر جزو برد یا باخت حساب نمی‌شه.
 """
 from dataclasses import dataclass, field
 from collections import Counter
 from numbers import Real
 import math
 import pandas as pd
+from dataclasses import dataclass as _dataclass
 
 from single_analysis import add_extended_indicators, build_single_result
 from trade_validation import TradeGeometryError, validate_trade_geometry
@@ -32,6 +44,20 @@ from trade_validation import TradeGeometryError, validate_trade_geometry
 DEFAULT_WARMUP_CANDLES = 60      # قبل از این تعداد کندل، اندیکاتورها (مخصوصاً SMA50) هنوز معتبر نیستن
 DEFAULT_MAX_HOLD_CANDLES = 60    # حداکثر تعداد کندلی که یه معامله باز می‌مونه قبل از timeout
 DEFAULT_BACKTEST_CANDLES = 300
+
+
+@_dataclass(frozen=True)
+class SimulationSettings:
+    """پیش‌فرض‌ها = رفتار قبلی بک‌تست (برای سازگاری)؛ هندلرها از engine_config می‌سازن"""
+    live_model: bool = False
+    fee_rate: float = 0.0          # کسر برای هر طرف (0.001 = 0.1%)
+    slippage: float = 0.0          # کسر برای خروج‌های بازار
+    scoring_mode: str = "classic"
+    breakeven_after_tp1: bool = True
+    max_cost_r: float = 0.0
+
+
+LEGACY_SIMULATION = SimulationSettings()
 MAX_BACKTEST_CANDLES = 500
 MIN_BACKTEST_CANDLES = 120
 
@@ -46,9 +72,18 @@ class BacktestTrade:
     sl: float
     tps: list
     exit_price: float
-    exit_reason: str  # "SL" | "TP3" | "TP2_TIMEOUT" | "TP1_TIMEOUT" | "TIMEOUT" | "STILL_OPEN"
-    r_multiple: float
+    exit_reason: str  # "SL" | "TP3" | "BREAKEVEN" | "TP2_TIMEOUT" | "TP1_TIMEOUT" | "TIMEOUT" | "STILL_OPEN"
+    r_multiple: float     # خالص (بعد از کارمزد/لغزش)
     confidence: int
+    gross_r: float = None  # قبل از کسر هزینه‌ها
+    cost_r: float = 0.0
+
+    @property
+    def outcome(self) -> str:
+        """win | loss | breakeven - سربه‌سر (BREAKEVEN) نه برد حساب می‌شه نه باخت (مثل /mystats)"""
+        if self.exit_reason == "BREAKEVEN":
+            return "breakeven"
+        return "win" if self.r_multiple > 0 else "loss"
 
 
 @dataclass
@@ -95,15 +130,24 @@ class BacktestResult:
 
     @property
     def wins(self) -> int:
-        return sum(1 for t in self.resolved_trades if t.r_multiple > 0)
+        return sum(1 for t in self.resolved_trades if t.outcome == "win")
+
+    @property
+    def breakevens(self) -> int:
+        return sum(1 for t in self.resolved_trades if t.outcome == "breakeven")
+
+    @property
+    def gross_total_r(self) -> float:
+        return sum((t.gross_r if t.gross_r is not None else t.r_multiple) for t in self.resolved_trades)
 
     @property
     def losses(self) -> int:
-        return sum(1 for t in self.resolved_trades if t.r_multiple <= 0)
+        return sum(1 for t in self.resolved_trades if t.outcome == "loss")
 
     @property
     def win_rate(self):
-        return (self.wins / self.total_trades * 100) if self.total_trades else None
+        decided = self.wins + self.losses
+        return (self.wins / decided * 100) if decided else None
 
     @property
     def total_r(self) -> float:
@@ -125,11 +169,13 @@ class BacktestResult:
     def max_consecutive_losses(self) -> int:
         streak, worst = 0, 0
         for t in self.resolved_trades:
-            if t.r_multiple <= 0:
+            outcome = t.outcome
+            if outcome == "loss":
                 streak += 1
                 worst = max(worst, streak)
-            else:
+            elif outcome == "win":
                 streak = 0
+            # سربه‌سر: رشته‌ی باخت رو نه ادامه می‌ده نه قطع می‌کنه
         return worst
 
     @property
@@ -199,17 +245,99 @@ def _simulate_trade(df: pd.DataFrame, entry_idx: int, direction: str, entry: flo
     return signed_r, reason, last_close, last_row["timestamp"], end_idx
 
 
+def _trade_cost_r(entry: float, exit_price: float, risk: float, sim: SimulationSettings,
+                  market_entry: bool, market_exit: bool) -> float:
+    """کارمزد ورود + خروج و لغزش سفارش‌های بازار، بر حسب R"""
+    if not risk or (sim.fee_rate <= 0 and sim.slippage <= 0):
+        return 0.0
+    cost = sim.fee_rate * (abs(entry) + abs(exit_price))
+    if market_entry:
+        cost += sim.slippage * abs(entry)
+    if market_exit:
+        cost += sim.slippage * abs(exit_price)
+    return cost / risk
+
+
+def _simulate_live_trade(df: pd.DataFrame, start_idx: int, direction: str, entry: float,
+                         sl: float, tps: list, max_hold: int, breakeven_after_tp1: bool) -> dict:
+    """
+    مدل هم‌سان با پایش زنده (scheduler/check_signal_performance_job):
+    سفارش limit روی entry، در هر کندل اول بدترین قیمت (SL) بعد بهترین (TP)،
+    توی کندل ورود فقط SL، و انتقال SL به ورود بعد از TP1.
+    خروجی dict با کلید status: "skipped" | "trade".
+    """
+    n = len(df)
+    is_buy = direction == "BUY"
+    opens, highs, lows, closes = (df[c].to_numpy(dtype=float) for c in ("open", "high", "low", "close"))
+    ts = df["timestamp"]
+
+    # --- انتظار برای پر شدن سفارش ---
+    wait_end = min(start_idx + max_hold - 1, n - 1)
+    fill_idx = None
+    fill_price = None
+    for j in range(start_idx, wait_end + 1):
+        o, h, l = opens[j], highs[j], lows[j]
+        if (is_buy and o <= sl) or (not is_buy and o >= sl):
+            return {"status": "skipped", "reason": "INVALIDATED_BEFORE_ENTRY", "index": j, "actual": o}
+        if (is_buy and l <= entry) or (not is_buy and h >= entry):
+            fill_idx = j
+            fill_price = min(o, entry) if is_buy else max(o, entry)
+            break
+    if fill_idx is None:
+        return {"status": "skipped", "reason": "NOT_FILLED", "index": wait_end, "actual": None}
+
+    risk = abs(fill_price - sl)
+    if risk <= 0:
+        return {"status": "skipped", "reason": "INVALID_ACTUAL_GEOMETRY", "index": fill_idx, "actual": fill_price}
+
+    def r_at(price):
+        return ((price - fill_price) if is_buy else (fill_price - price)) / risk
+
+    cur_sl = sl
+    moved = False
+    hold_end = min(fill_idx + max_hold, n - 1)
+    for j in range(fill_idx, hold_end + 1):
+        adverse = lows[j] if is_buy else highs[j]
+        favorable = highs[j] if is_buy else lows[j]
+        if (is_buy and adverse <= cur_sl) or (not is_buy and adverse >= cur_sl):
+            return {"status": "trade", "fill_idx": fill_idx, "fill_price": fill_price, "risk": risk,
+                    "exit_idx": j, "exit_price": cur_sl, "reason": "BREAKEVEN" if moved else "SL",
+                    "gross_r": r_at(cur_sl), "market_exit": True, "time": ts.iloc[j]}
+        if j == fill_idx:
+            continue  # کندل ورود: ترتیب داخل کندل معلوم نیست، TP رو از کندل بعد چک می‌کنیم
+        reached = lambda level: (favorable >= level) if is_buy else (favorable <= level)
+        if reached(tps[2]):
+            return {"status": "trade", "fill_idx": fill_idx, "fill_price": fill_price, "risk": risk,
+                    "exit_idx": j, "exit_price": tps[2], "reason": "TP3",
+                    "gross_r": r_at(tps[2]), "market_exit": False, "time": ts.iloc[j]}
+        if breakeven_after_tp1 and not moved and reached(tps[0]):
+            cur_sl = fill_price
+            moved = True
+
+    is_data_end = hold_end == n - 1
+    last_close = closes[hold_end]
+    return {"status": "trade", "fill_idx": fill_idx, "fill_price": fill_price, "risk": risk,
+            "exit_idx": hold_end, "exit_price": last_close,
+            "reason": "STILL_OPEN" if is_data_end else "TIMEOUT",
+            "gross_r": r_at(last_close), "market_exit": True, "time": ts.iloc[hold_end]}
+
+
 def run_backtest(
     df: pd.DataFrame, symbol: str, timeframe: str,
     confidence_threshold_fraction: float = None, atr_sl_mult: float = None, rr_targets: list = None,
     warmup: int = DEFAULT_WARMUP_CANDLES, max_hold: int = DEFAULT_MAX_HOLD_CANDLES,
+    sim: SimulationSettings = None,
 ) -> BacktestResult:
     """
+    sim=None یعنی مدل قبلی بدون هزینه (سازگاری)؛ برای مدل هم‌سان با پایش زنده
+    و کارمزد، SimulationSettings(live_model=True, ...) بده.
+
     df باید کندل‌های خام (بدون اندیکاتور) و مرتب‌شده بر اساس زمان باشه.
     اندیکاتورها یه‌بار این‌جا (وکتایرایز، سریع) محاسبه می‌شن.
     فقط هندسهٔ معتبر در open کندل بعد شبیه‌سازی می‌شود؛ ردشدگی جدا گزارش
     می‌شود و به‌جای ورود واقعی سفارش یا اعتبارسنجی کامل OHLC نیست.
     """
+    sim = sim or LEGACY_SIMULATION
     df = add_extended_indicators(df.copy()).reset_index(drop=True)
     n = len(df)
     trades = []
@@ -237,6 +365,8 @@ def run_backtest(
                 sub_df, symbol, timeframe,
                 confidence_threshold_fraction=confidence_threshold_fraction,
                 atr_sl_mult=atr_sl_mult, rr_targets=rr_targets,
+                scoring_mode=sim.scoring_mode,
+                fee_rate=sim.fee_rate, slippage=sim.slippage, max_cost_r=sim.max_cost_r,
             )
         except TradeGeometryError:
             reject_entry("INVALID_SIGNAL_LEVELS", i, entry_idx)
@@ -254,6 +384,39 @@ def run_backtest(
         except TradeGeometryError:
             reject_entry("INVALID_SIGNAL_LEVELS", i, entry_idx, result)
             i += 1
+            continue
+
+        if sim.live_model:
+            outcome = _simulate_live_trade(
+                df, entry_idx, result.direction, float(result.entry), stop_price, list(targets),
+                max_hold, sim.breakeven_after_tp1,
+            )
+            if outcome["status"] == "skipped":
+                reject_entry(outcome["reason"], i, outcome["index"], result, outcome["actual"])
+                # مثل پایش زنده: تا وقتی سیگنال در انتظار ورود بوده، سیگنال جدید نمی‌گیریم
+                i = outcome["index"] + 1
+                continue
+            gross = outcome["gross_r"]
+            cost = 0.0
+            if outcome["reason"] != "STILL_OPEN":
+                cost = _trade_cost_r(outcome["fill_price"], outcome["exit_price"], outcome["risk"], sim,
+                                     market_entry=False, market_exit=outcome["market_exit"])
+            trades.append(BacktestTrade(
+                entry_index=outcome["fill_idx"],
+                entry_time=df.iloc[outcome["fill_idx"]]["timestamp"],
+                exit_time=outcome["time"],
+                direction=result.direction,
+                entry=outcome["fill_price"],
+                sl=stop_price,
+                tps=list(targets),
+                exit_price=outcome["exit_price"],
+                exit_reason=outcome["reason"],
+                r_multiple=round(gross - cost, 3),
+                confidence=result.confidence_percent,
+                gross_r=round(gross, 3),
+                cost_r=round(cost, 3),
+            ))
+            i = outcome["exit_idx"] + 1
             continue
 
         # Read the column directly, retaining bool/text types rather than coercing them.
@@ -284,6 +447,12 @@ def run_backtest(
         r, reason, exit_price, exit_time, exit_idx = _simulate_trade(
             df, entry_idx, result.direction, entry_price, stop_price, list(targets), max_hold
         )
+        gross = r
+        cost = 0.0
+        if reason != "STILL_OPEN":
+            cost = _trade_cost_r(entry_price, exit_price, abs(entry_price - stop_price), sim,
+                                 market_entry=True, market_exit=reason in ("SL", "TIMEOUT"))
+        r = gross - cost
 
         trades.append(BacktestTrade(
             entry_index=entry_idx,
@@ -297,6 +466,8 @@ def run_backtest(
             exit_reason=reason,
             r_multiple=round(r, 3),
             confidence=result.confidence_percent,
+            gross_r=round(gross, 3),
+            cost_r=round(cost, 3),
         ))
 
         # تا وقتی این معامله باز بوده، سیگنال جدید حساب نمی‌کنیم (بدون هم‌پوشانی)
@@ -317,6 +488,7 @@ def run_walk_forward_backtest(
     df: pd.DataFrame, symbol: str, timeframe: str, segments: int,
     confidence_threshold_fraction: float = None, atr_sl_mult: float = None, rr_targets: list = None,
     warmup: int = DEFAULT_WARMUP_CANDLES, max_hold: int = DEFAULT_MAX_HOLD_CANDLES,
+    sim: SimulationSettings = None,
 ) -> list:
     """
     داده‌ی تاریخی رو به `segments` بازه‌ی مساوی و بدون هم‌پوشانی تقسیم
@@ -355,7 +527,7 @@ def run_walk_forward_backtest(
             segment_df, symbol, timeframe,
             confidence_threshold_fraction=confidence_threshold_fraction,
             atr_sl_mult=atr_sl_mult, rr_targets=rr_targets,
-            warmup=effective_warmup, max_hold=max_hold,
+            warmup=effective_warmup, max_hold=max_hold, sim=sim,
         )
         # date_from رو به شروع واقعی این بازه (نه کندل‌های قرضی warmup)
         # اصلاح می‌کنیم، وگرنه توی نمایش به‌اشتباه به‌نظر میاد بازه‌ها
@@ -390,7 +562,7 @@ class CalibrationCandidate:
 
 def evaluate_calibration_candidate(
     symbol_dfs: list, confidence_threshold_fraction: float, atr_sl_mult: float,
-    segments: int = CALIBRATION_SEGMENTS,
+    segments: int = CALIBRATION_SEGMENTS, sim: SimulationSettings = None,
 ) -> CalibrationCandidate:
     """
     یه ترکیب (confidence_threshold_fraction, atr_sl_mult) رو روی همه‌ی
@@ -409,7 +581,7 @@ def evaluate_calibration_candidate(
             results = run_walk_forward_backtest(
                 df, symbol, timeframe, segments=segments,
                 confidence_threshold_fraction=confidence_threshold_fraction,
-                atr_sl_mult=atr_sl_mult,
+                atr_sl_mult=atr_sl_mult, sim=sim,
             )
         except Exception:
             continue  # این نماد رو رد می‌کنیم، بقیه رو ادامه می‌دیم
@@ -423,8 +595,9 @@ def evaluate_calibration_candidate(
 
     total_trades = len(all_resolved_trades)
     if total_trades:
-        wins = sum(1 for t in all_resolved_trades if t.r_multiple > 0)
-        win_rate = wins / total_trades * 100
+        wins = sum(1 for t in all_resolved_trades if t.outcome == "win")
+        decided = sum(1 for t in all_resolved_trades if t.outcome != "breakeven")
+        win_rate = (wins / decided * 100) if decided else None
         total_r = sum(t.r_multiple for t in all_resolved_trades)
         avg_r = total_r / total_trades
     else:
@@ -460,7 +633,8 @@ def evaluate_calibration_candidate(
     )
 
 
-def run_weight_calibration(symbol_dfs: list, segments: int = CALIBRATION_SEGMENTS) -> list:
+def run_weight_calibration(symbol_dfs: list, segments: int = CALIBRATION_SEGMENTS,
+                           sim: SimulationSettings = None) -> list:
     """
     گرید-سرچ روی ترکیب‌های confidence_threshold_fraction × atr_sl_mult؛
     خروجی لیستی از CalibrationCandidate، مرتب‌شده: قابل‌اتکاها اول
@@ -471,7 +645,7 @@ def run_weight_calibration(symbol_dfs: list, segments: int = CALIBRATION_SEGMENT
     for confidence_threshold_fraction in CALIBRATION_CONFIDENCE_CANDIDATES:
         for atr_sl_mult in CALIBRATION_ATR_SL_MULT_CANDIDATES:
             candidates.append(evaluate_calibration_candidate(
-                symbol_dfs, confidence_threshold_fraction, atr_sl_mult, segments=segments,
+                symbol_dfs, confidence_threshold_fraction, atr_sl_mult, segments=segments, sim=sim,
             ))
 
     reliable = [c for c in candidates if c.reliable]

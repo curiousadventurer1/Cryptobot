@@ -120,3 +120,82 @@ async def get_historical_performance(symbol: str, timeframe: str, direction: str
         "breakeven": counts["breakeven"],
         "sample_size": decided,
     }
+
+
+# ==================== فاز ۳: عملکرد تاریخی بر پایه‌ی R ====================
+
+def _outcome_r(row: dict) -> float | None:
+    """
+    R واقعی مدل پایش (یه پوزیشن کامل، SL بعد از TP1 به ورود منتقل می‌شه):
+    TP3 = +فاصله‌ی TP3 بر حسب ریسک اولیه، SL = -1، سربه‌سر = 0.
+    ریسک اولیه از initial_sl (رکوردهای جدید)؛ برای رکوردهای قدیمی از
+    فاصله‌ی TP1 با فرض TP1 = 1R تخمین زده می‌شه.
+    """
+    entry = row.get("entry")
+    if not entry:
+        return None
+    if row.get("initial_sl") is not None:
+        risk = abs(entry - row["initial_sl"])
+    elif row.get("tp1") is not None:
+        risk = abs(row["tp1"] - entry)
+    else:
+        return None
+    if not risk:
+        return None
+    status = row["status"]
+    if status == "TP3_HIT":
+        return abs(row["tp3"] - entry) / risk
+    if status == "SL_HIT":
+        return -1.0
+    if status == "BREAKEVEN_HIT":
+        return 0.0
+    return None
+
+
+async def get_historical_performance_v2(symbol: str, timeframe: str, direction: str,
+                                        since: str | None = None,
+                                        fee_rate: float = 0.0, slippage: float = 0.0) -> dict | None:
+    """
+    - یکتا: اگه چند کاربر همون سیگنال (همون entry/TP1/TP3) رو پیگیری کرده
+      باشن، فقط یه بار شمرده می‌شه (قبلاً هر کاربر یه نمونه‌ی جدا بود)
+    - since: فقط سیگنال‌های بعد از این زمان (پیش‌فرض: از زمان به‌روزرسانی
+      فاز ۳، چون پایش قبلی لمس‌های بین دو بررسی رو جا می‌انداخت)
+    - هزینه‌ی کارمزد/لغزش از R هر نمونه کم می‌شه
+    خروجی None اگه کمتر از HISTORY_MIN_SAMPLES نمونه‌ی یکتا باشه.
+    """
+    from config import HISTORY_MIN_SAMPLES, HISTORY_PRIOR_STRENGTH
+    rows = await db.get_resolved_signal_details_for(symbol, timeframe, direction, since=since)
+    seen = set()
+    rs = []
+    counts = {"win": 0, "loss": 0, "breakeven": 0}
+    for row in rows:
+        key = (row["entry"], row["tp1"], row["tp3"])
+        if key in seen:
+            continue
+        seen.add(key)
+        r = _outcome_r(row)
+        if r is None:
+            continue
+        outcome = _classify(row["status"])
+        if outcome:
+            counts[outcome] += 1
+        risk = abs(row["entry"] - row["initial_sl"]) if row.get("initial_sl") is not None else abs(row["tp1"] - row["entry"])
+        if risk:
+            r -= abs(row["entry"]) * (2 * fee_rate + slippage) / risk
+        rs.append(r)
+
+    n = len(rs)
+    if n < HISTORY_MIN_SAMPLES:
+        return None
+    total = sum(rs)
+    decided = counts["win"] + counts["loss"]
+    return {
+        "version": 2,
+        "expectancy_r": total / n,
+        "shrunk_r": total / (n + HISTORY_PRIOR_STRENGTH),
+        "sample_size": n,
+        "wins": counts["win"],
+        "losses": counts["loss"],
+        "breakeven": counts["breakeven"],
+        "win_rate": (counts["win"] / decided * 100) if decided else None,
+    }

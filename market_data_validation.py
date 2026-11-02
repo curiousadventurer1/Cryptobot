@@ -130,3 +130,44 @@ def ohlcv_frame_from_raw(raw, *, limit):
         raise MarketDataError("INVALID_TIMESTAMP") from error
     validate_ohlcv_frame(df)
     return df.tail(limit).reset_index(drop=True)
+
+# ---------- کندل بسته‌نشده (فاز ۳) ----------
+
+_TIMEFRAME_UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def timeframe_to_seconds(timeframe: str) -> int:
+    """'15m' -> 900 ؛ ماهانه ('1M') تقریبی ۳۰ روز. ورودی نامعتبر -> ValueError"""
+    if not isinstance(timeframe, str) or len(timeframe) < 2:
+        raise ValueError(f"Invalid timeframe: {timeframe!r}")
+    amount, unit = timeframe[:-1], timeframe[-1]
+    if not amount.isdigit() or int(amount) <= 0:
+        raise ValueError(f"Invalid timeframe: {timeframe!r}")
+    if unit == "M":
+        return int(amount) * 30 * 86400
+    if unit not in _TIMEFRAME_UNIT_SECONDS:
+        raise ValueError(f"Invalid timeframe: {timeframe!r}")
+    return int(amount) * _TIMEFRAME_UNIT_SECONDS[unit]
+
+
+def drop_unclosed_candle(df: pd.DataFrame, timeframe: str, now: pd.Timestamp | None = None) -> pd.DataFrame:
+    """
+    صرافی آخرین کندل رو در حال شکل‌گیری برمی‌گردونه؛ تحلیل روی اون باعث
+    repaint می‌شه (سیگنالی که وسط کندل صادر و تا آخرش غیب می‌شه). اگه
+    زمان بسته‌شدن آخرین کندل هنوز نرسیده، حذفش می‌کنیم.
+    timestamp ها naive-UTC هستن (همون قرارداد ohlcv_frame_from_raw).
+    """
+    if df is None or df.empty:
+        return df
+    try:
+        seconds = timeframe_to_seconds(timeframe)
+    except ValueError:
+        return df
+    if now is None:
+        now = pd.Timestamp.now(tz="UTC").tz_localize(None)
+    last_open = pd.Timestamp(df["timestamp"].iloc[-1])
+    if last_open.tzinfo is not None:
+        last_open = last_open.tz_convert("UTC").tz_localize(None)
+    if last_open + pd.Timedelta(seconds=seconds) > now:
+        return df.iloc[:-1].reset_index(drop=True)
+    return df

@@ -7,6 +7,7 @@
 import logging
 import asyncio
 import math
+import time
 import aiosqlite
 from collections import defaultdict
 from telegram.ext import Application
@@ -137,6 +138,11 @@ async def check_signal_performance_job(app: Application):
     بعد از ثبت گذار و درست پیش از ارسال دوباره بررسی می‌شود.
     هر نوبت فقط یک دسته‌ی چرخشی رزرو می‌شود؛ نشانگر پیش از شبکه ثبت
     می‌شود و موفقیت دریافت قیمت را اثبات نمی‌کند. سقف چرخه ثابت است.
+
+    فاز ۳ (engine_ohlc_tracking=1): به‌جای یک قیمت لحظه‌ای، کندل‌های بسته‌شده‌ی
+    ۵ دقیقه‌ای از آخرین نشانگر (monitor_cursor_ms) بررسی می‌شن تا لمس‌های بین
+    دو نوبت جا نیفتن؛ رکوردهای قدیمی از همین لحظه وارد این مسیر می‌شن و اگه
+    دریافت کندل ناموفق باشه، همون مسیر قیمت لحظه‌ای بالا اجرا می‌شه.
     """
     from config import MAX_OPEN_SIGNALS_PER_CHECK, BREAKEVEN_AFTER_TP1
 
@@ -149,24 +155,76 @@ async def check_signal_performance_job(app: Application):
     if not open_signals:
         return
 
-    symbols = {s["symbol"] for s in open_signals}
+    from engine_config import get_engine_config
+    engine_cfg = await get_engine_config()
+
     client = ExchangeClient()
-    prices = {}
     semaphore = asyncio.Semaphore(SCAN_CONCURRENCY)
+    now_ms = int(time.time() * 1000)
 
-    async def _fetch_price(symbol):
-        async with semaphore:
-            try:
-                prices[symbol] = await client.fetch_ticker_price(symbol)
-            except Exception as e:
-                logger.warning(f"دریافت قیمت {symbol} ناموفق بود: {e}")
+    # --- فاز ۳: پایش کندلی (سقف/کف کندل‌های ۵ دقیقه‌ای از آخرین بررسی) ---
+    cursors = {}
+    candle_signals, ticker_signals = [], []
+    if engine_cfg.ohlc_tracking:
+        try:
+            cursors = await db.get_monitor_cursors([sig["id"] for sig in open_signals])
+        except aiosqlite.Error:
+            logger.exception("خواندن نشانگر پایش کندلی ناموفق بود؛ این نوبت با قیمت لحظه‌ای.")
+            cursors = {}
+        for sig in open_signals:
+            cursor = cursors.get(sig["id"])
+            if cursor is None:
+                # رکورد قدیمی (قبل از فاز ۳): از همین الان کندلی پایش می‌شه؛ این نوبت با تیکر
+                try:
+                    await db.set_monitor_cursor(sig["id"], now_ms)
+                except aiosqlite.Error:
+                    pass
+                ticker_signals.append(sig)
+            else:
+                candle_signals.append(sig)
+    else:
+        ticker_signals = list(open_signals)
 
-    try:
-        await asyncio.gather(*(_fetch_price(symbol) for symbol in symbols))
-    finally:
-        await client.close()
+    candles_by_symbol = {}
+    if candle_signals:
+        since_by_symbol = {}
+        for sig in candle_signals:
+            c = cursors[sig["id"]]
+            since_by_symbol[sig["symbol"]] = min(c, since_by_symbol.get(sig["symbol"], c))
 
-    for sig in open_signals:
+        async def _fetch_candles(symbol, since_ms):
+            async with semaphore:
+                try:
+                    candles_by_symbol[symbol] = await _fetch_closed_monitor_candles(client, symbol, since_ms, now_ms)
+                except Exception as e:
+                    logger.warning(f"دریافت کندل‌های پایش {symbol} ناموفق بود (برگشت به قیمت لحظه‌ای): {e}")
+
+        await asyncio.gather(*(_fetch_candles(sym, since) for sym, since in since_by_symbol.items()))
+        for sig in list(candle_signals):
+            if sig["symbol"] not in candles_by_symbol:
+                candle_signals.remove(sig)
+                ticker_signals.append(sig)
+
+    prices = {}
+    if ticker_signals:
+        async def _fetch_price(symbol):
+            async with semaphore:
+                try:
+                    prices[symbol] = await client.fetch_ticker_price(symbol)
+                except Exception as e:
+                    logger.warning(f"دریافت قیمت {symbol} ناموفق بود: {e}")
+
+        await asyncio.gather(*(_fetch_price(symbol) for symbol in {s["symbol"] for s in ticker_signals}))
+    await client.close()
+
+    for sig in candle_signals:
+        try:
+            await _track_signal_with_candles(app, sig, candles_by_symbol[sig["symbol"]],
+                                             cursors[sig["id"]], BREAKEVEN_AFTER_TP1)
+        except aiosqlite.Error:
+            logger.exception("پایش کندلی سیگنال %s ناموفق بود؛ سایر سیگنال‌ها ادامه دارند.", sig["id"])
+
+    for sig in ticker_signals:
         price = prices.get(sig["symbol"])
         if not db.is_valid_price(price):
             continue
@@ -178,28 +236,10 @@ async def check_signal_performance_job(app: Application):
                     "این وضعیت برد یا باخت معامله نیست؛ مسیر قیمت بین دو مشاهده معلوم نیست."
                 )
             elif await db.activate_signal_entry(sig["id"], price):
-                entry_note = (
-                    "ورود فرضی در مدل پایش فعال شد؛ این پیام تأیید اجرای سفارش واقعی نیست.\n"
-                    "Entry برنامه‌ریزی‌شده تغییر نکرده و قیمت مشاهده‌شده جدا ثبت شده است."
-                )
+                entry_note = ENTRY_ACTIVATED_NOTE
             else:
                 continue
-            if not await _can_send_background(sig["user_id"], "performance"):
-                continue
-            try:
-                await app.bot.send_message(
-                    chat_id=sig["user_id"],
-                    text=(
-                        f"📌 *پایش سیگنال {sig['symbol']}* ({sig['timeframe']})\n"
-                        f"{entry_note}\n"
-                        f"قیمت مشاهده‌شده: `{price:,.4f}`\n"
-                        f"Entry برنامه‌ریزی‌شده: `{sig['entry']:,.4f}`\n\n"
-                        "برای مشاهده وضعیت: /mysignals و /mystats"
-                    ),
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            except Exception as e:
-                logger.warning(f"ارسال وضعیت ورود به {sig['user_id']} ناموفق بود: {e}")
+            await _notify_entry(app, sig, entry_note, price)
             continue  # TP/SL فقط در مشاهده‌های بعد از فعال‌سازی پایش می‌شوند.
 
         try:
@@ -211,40 +251,147 @@ async def check_signal_performance_job(app: Application):
             continue
         if committed is None:
             continue
-        sig = committed
-        candidate_status = sig["status"]
-
-        breakeven_note = ""
-        if sig["breakeven_changed"]:
-            breakeven_note = "\n\n🛡 حد ضرر ثبت‌شده در پایش به نقطه‌ی سربه‌سر (Break-even) منتقل شد؛ این تغییر، سفارش واقعی صرافی را تغییر نمی‌دهد."
-
-        emoji = {"TP1_HIT": "🎯", "TP2_HIT": "🎯", "TP3_HIT": "🎯",
-                 "SL_HIT": "🛑", "BREAKEVEN_HIT": "🛡"}[candidate_status]
-        status_fa = {
-            "TP1_HIT": "به TP1 رسید", "TP2_HIT": "به TP2 رسید",
-            "TP3_HIT": "به TP3 رسید (سیگنال بسته شد ✅)",
-            "SL_HIT": "به حد ضرر خورد (سیگنال بسته شد ❌)",
-            "BREAKEVEN_HIT": "به حد ضرر سربه‌سرِ مدل پایش برگشت (بسته شد ⚪️؛ کارمزد/لغزش محاسبه نشده)",
-        }[candidate_status]
-        if not await _can_send_background(sig["user_id"], "performance"):
-            continue
-        try:
-            await app.bot.send_message(
-                chat_id=sig["user_id"],
-                text=(
-                    f"{emoji} *بروزرسانی سیگنال {sig['symbol']}* ({sig['timeframe']})\n"
-                    f"وضعیت: {status_fa}\n"
-                    f"قیمت فعلی: `{price:,.4f}`\n"
-                    f"ورود: `{sig['entry']:,.4f}`"
-                    f"{breakeven_note}\n\n"
-                    f"برای دیدن آمار کلی: /mystats"
-                ),
-                parse_mode=ParseMode.MARKDOWN
-            )
-        except Exception as e:
-            logger.warning(f"ارسال بروزرسانی عملکرد به {sig['user_id']} ناموفق بود: {e}")
+        await _notify_transition(app, committed, price)
 
     logger.info("پایش عملکرد سیگنال‌ها تمام شد.")
+
+
+# ==================== فاز ۳: پایش کندلی ====================
+
+MONITOR_TIMEFRAME = "5m"
+MONITOR_TF_MS = 5 * 60 * 1000
+MONITOR_MAX_CANDLES = 1000
+TERMINAL_STATUSES = ("TP3_HIT", "SL_HIT", "BREAKEVEN_HIT", "ENTRY_INVALIDATED")
+
+ENTRY_ACTIVATED_NOTE = (
+    "ورود فرضی در مدل پایش فعال شد؛ این پیام تأیید اجرای سفارش واقعی نیست.\n"
+    "Entry برنامه‌ریزی‌شده تغییر نکرده و قیمت مشاهده‌شده جدا ثبت شده است."
+)
+
+
+async def _fetch_closed_monitor_candles(client, symbol: str, since_ms: int, now_ms: int) -> list:
+    """کندل‌های بسته‌شده‌ی ۵ دقیقه‌ای از since_ms: [(open_ms, o, h, l, c), ...]"""
+    from market_data_validation import ohlcv_frame_from_raw
+    raw = await client.exchange.fetch_ohlcv(symbol, timeframe=MONITOR_TIMEFRAME, since=int(since_ms),
+                                            limit=MONITOR_MAX_CANDLES)
+    df = ohlcv_frame_from_raw(raw, limit=MONITOR_MAX_CANDLES)  # اعتبارسنجی سخت‌گیرانه (همون مسیر تحلیل)
+    out = []
+    for ts, o, h, l, c in zip(df["timestamp"], df["open"], df["high"], df["low"], df["close"]):
+        open_ms = int(ts.value // 1_000_000)
+        if open_ms + MONITOR_TF_MS <= now_ms:
+            out.append((open_ms, float(o), float(h), float(l), float(c)))
+    return out
+
+
+async def _notify_entry(app, sig: dict, entry_note: str, price: float):
+    if not await _can_send_background(sig["user_id"], "performance"):
+        return
+    try:
+        await app.bot.send_message(
+            chat_id=sig["user_id"],
+            text=(
+                f"📌 *پایش سیگنال {sig['symbol']}* ({sig['timeframe']})\n"
+                f"{entry_note}\n"
+                f"قیمت مشاهده‌شده: `{price:,.4f}`\n"
+                f"Entry برنامه‌ریزی‌شده: `{sig['entry']:,.4f}`\n\n"
+                "برای مشاهده وضعیت: /mysignals و /mystats"
+            ),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        logger.warning(f"ارسال وضعیت ورود به {sig['user_id']} ناموفق بود: {e}")
+
+
+async def _notify_transition(app, sig: dict, price: float):
+    candidate_status = sig["status"]
+    breakeven_note = ""
+    if sig["breakeven_changed"]:
+        breakeven_note = "\n\n🛡 حد ضرر ثبت‌شده در پایش به نقطه‌ی سربه‌سر (Break-even) منتقل شد؛ این تغییر، سفارش واقعی صرافی را تغییر نمی‌دهد."
+
+    emoji = {"TP1_HIT": "🎯", "TP2_HIT": "🎯", "TP3_HIT": "🎯",
+             "SL_HIT": "🛑", "BREAKEVEN_HIT": "🛡"}[candidate_status]
+    status_fa = {
+        "TP1_HIT": "به TP1 رسید", "TP2_HIT": "به TP2 رسید",
+        "TP3_HIT": "به TP3 رسید (سیگنال بسته شد ✅)",
+        "SL_HIT": "به حد ضرر خورد (سیگنال بسته شد ❌)",
+        "BREAKEVEN_HIT": "به حد ضرر سربه‌سرِ مدل پایش برگشت (بسته شد ⚪️؛ کارمزد/لغزش محاسبه نشده)",
+    }[candidate_status]
+    if not await _can_send_background(sig["user_id"], "performance"):
+        return
+    try:
+        await app.bot.send_message(
+            chat_id=sig["user_id"],
+            text=(
+                f"{emoji} *بروزرسانی سیگنال {sig['symbol']}* ({sig['timeframe']})\n"
+                f"وضعیت: {status_fa}\n"
+                f"قیمت مشاهده‌شده: `{price:,.4f}`\n"
+                f"ورود: `{sig['entry']:,.4f}`"
+                f"{breakeven_note}\n\n"
+                f"برای دیدن آمار کلی: /mystats"
+            ),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        logger.warning(f"ارسال بروزرسانی عملکرد به {sig['user_id']} ناموفق بود: {e}")
+
+
+async def _track_signal_with_candles(app, sig: dict, candles: list, cursor_ms: int,
+                                     breakeven_enabled: bool):
+    """
+    کندل‌به‌کندل از آخرین نشانگر جلو می‌ره (هم‌سان با بک‌تست live_model):
+    - در انتظار ورود: گپ open به آن‌سوی SL = ابطال؛ لمس Entry = ورود با
+      min(open, entry) (برای SELL: max)؛ توی همون کندل فقط SL چک می‌شه
+    - فعال: اول بدترین قیمت کندل (SL/سربه‌سر)، بعد بهترین (TP1/TP2/TP3)
+    گذارها از همون توابع اتمیک دیتابیس (activate/advance) ثبت می‌شن.
+    """
+    is_buy = sig["direction"] == "BUY"
+    status = sig["status"]
+    new_cursor = cursor_ms
+    for open_ms, o, h, l, c in candles:
+        if open_ms < cursor_ms:
+            continue
+        new_cursor = open_ms + MONITOR_TF_MS
+        adverse = l if is_buy else h
+        favorable = h if is_buy else l
+
+        if status == "WAITING_ENTRY":
+            sl, entry = sig["sl"], sig["entry"]
+            if (is_buy and o <= sl) or (not is_buy and o >= sl):
+                if await db.invalidate_waiting_entry(sig["id"], o):
+                    await _notify_entry(app, sig, (
+                        "سیگنال پیش از ورود فرضی باطل شد؛ قیمت با گپ از SL عبور کرد.\n"
+                        "این وضعیت برد یا باخت معامله نیست."), o)
+                    status = "ENTRY_INVALIDATED"
+                break
+            if not ((is_buy and l <= entry) or (not is_buy and h >= entry)):
+                continue
+            fill = min(o, entry) if is_buy else max(o, entry)
+            if not await db.activate_signal_entry(sig["id"], fill):
+                break  # وضعیت عوض شده (مثلاً هم‌زمان)؛ دست نمی‌زنیم
+            await _notify_entry(app, sig, ENTRY_ACTIVATED_NOTE, fill)
+            status = "OPEN"
+            # کندل ورود: ترتیب داخل کندل معلوم نیست؛ فقط SL (محافظه‌کارانه)
+            if (is_buy and adverse <= sl) or (not is_buy and adverse >= sl):
+                committed = await db.advance_signal_performance(sig["id"], adverse, breakeven_enabled)
+                if committed:
+                    await _notify_transition(app, committed, adverse)
+                    status = committed["status"]
+                    if status in TERMINAL_STATUSES:
+                        break
+            continue
+
+        for price in (adverse, favorable):
+            committed = await db.advance_signal_performance(sig["id"], price, breakeven_enabled)
+            if committed:
+                await _notify_transition(app, committed, price)
+                status = committed["status"]
+                if status in TERMINAL_STATUSES:
+                    break
+        if status in TERMINAL_STATUSES:
+            break
+
+    if new_cursor != cursor_ms and status not in TERMINAL_STATUSES:
+        await db.set_monitor_cursor(sig["id"], new_cursor)
 
 
 async def news_auto_job(app: Application):

@@ -120,8 +120,15 @@ def _classify_liquidity(quote_volume_24h: float) -> str:
     return "پایین 🔴 (ریسک اسپرد/لغزش قیمت بیشتر)"
 
 
-async def analyze_symbol(client: ExchangeClient, symbol: str) -> SignalResult:
-    """تحلیل کامل یک نماد روی همه‌ی تایم‌فریم‌های تنظیم‌شده"""
+async def analyze_symbol(client: ExchangeClient, symbol: str, closed_only: bool | None = None) -> SignalResult:
+    """
+    تحلیل کامل یک نماد روی همه‌ی تایم‌فریم‌های تنظیم‌شده.
+    closed_only=None یعنی از تنظیم engine_closed_candles پیروی کن (فاز ۳):
+    بدون کندل در حال شکل‌گیری، سیگنال اسکن خودکار وسط کندل عوض/غیب نمی‌شه.
+    """
+    if closed_only is None:
+        from engine_config import get_engine_config
+        closed_only = (await get_engine_config()).closed_candles
     timeframe_results = []
     total_weighted_score = 0
     max_possible = 0
@@ -130,7 +137,7 @@ async def analyze_symbol(client: ExchangeClient, symbol: str) -> SignalResult:
     # دریافت هم‌زمان همهٔ تایم‌فریم‌ها + تیکر (به‌جای پشت‌سرهم)
     items = list(TIMEFRAMES.items())
     fetched = await asyncio.gather(
-        *(client.fetch_ohlcv_df(symbol, tf, limit=cfg["candles"]) for tf, cfg in items),
+        *(client.fetch_ohlcv_df(symbol, tf, limit=cfg["candles"], closed_only=closed_only) for tf, cfg in items),
         client.exchange.fetch_ticker(symbol),
         return_exceptions=True,
     )
@@ -181,6 +188,10 @@ async def analyze_symbol(client: ExchangeClient, symbol: str) -> SignalResult:
             raise ticker
         quote_volume_24h = float(ticker.get("quoteVolume") or 0.0)
         price_change_pct = float(ticker.get("percentage") or 0.0)
+        # با کندل‌های بسته‌شده، close آخرین کندل ممکنه قدیمی باشه؛ برای نمایش قیمت لحظه‌ای
+        live_last = float(ticker.get("last") or 0.0)
+        if live_last > 0 and live_last == live_last and live_last != float("inf"):
+            last_close = live_last
     except Exception:
         pass
 

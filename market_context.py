@@ -42,7 +42,8 @@ def _quick_trend_direction(df: pd.DataFrame) -> str:
     return "NEUTRAL"
 
 
-async def check_higher_timeframe_alignment(client, symbol: str, timeframe: str, signal_direction: str) -> dict | None:
+async def check_higher_timeframe_alignment(client, symbol: str, timeframe: str, signal_direction: str,
+                                           closed_only: bool = False) -> dict | None:
     """
     خروجی: {"higher_tf": "4h", "higher_tf_direction": "BUY"/"SELL"/"NEUTRAL", "aligned": bool}
     یا None اگه تایم‌فریم بالاتری برای مقایسه وجود نداشته باشه (مثلاً روزانه)
@@ -52,7 +53,7 @@ async def check_higher_timeframe_alignment(client, symbol: str, timeframe: str, 
         return None
 
     try:
-        df = await client.fetch_ohlcv_df(symbol, higher_tf, limit=60)
+        df = await client.fetch_ohlcv_df(symbol, higher_tf, limit=60, closed_only=closed_only)
     except Exception:
         return None
 
@@ -69,7 +70,8 @@ async def check_higher_timeframe_alignment(client, symbol: str, timeframe: str, 
     }
 
 
-async def check_second_higher_timeframe_alignment(client, symbol: str, timeframe: str, signal_direction: str) -> dict | None:
+async def check_second_higher_timeframe_alignment(client, symbol: str, timeframe: str, signal_direction: str,
+                                                  closed_only: bool = False) -> dict | None:
     """
     مثل check_higher_timeframe_alignment ولی روی یه تایم‌فریم حتی بالاتر (دومی) که توی
     SECOND_HIGHER_TIMEFRAME_MAP تعریف شده - برای ادفام هم‌جهتی چندتایم‌فریمی.
@@ -81,7 +83,7 @@ async def check_second_higher_timeframe_alignment(client, symbol: str, timeframe
         return None
 
     try:
-        df = await client.fetch_ohlcv_df(symbol, higher_tf, limit=60)
+        df = await client.fetch_ohlcv_df(symbol, higher_tf, limit=60, closed_only=closed_only)
     except Exception:
         return None
 
@@ -99,7 +101,8 @@ async def check_second_higher_timeframe_alignment(client, symbol: str, timeframe
 
 
 async def check_btc_correlation(client, symbol: str, timeframe: str,
-                                symbol_df: pd.DataFrame | None = None) -> dict | None:
+                                symbol_df: pd.DataFrame | None = None,
+                                closed_only: bool = False) -> dict | None:
     """
     محاسبه‌ی همبستگی بازدهی این ارز با بیت‌کوین روی همین تایم‌فریم.
     خروجی: {"correlation": float, "high_correlation": bool} یا None اگه
@@ -111,9 +114,12 @@ async def check_btc_correlation(client, symbol: str, timeframe: str,
     # اگه کندل‌های همین نماد/تایم‌فریم از قبل دریافت شده (symbol_df)، دوباره
     # دانلود نمی‌کنیم؛ آخرین LOOKBACK+5 کندل همان چیزی است که fetch جدا می‌داد.
     try:
-        btc_df = await client.fetch_ohlcv_df(BTC_SYMBOL, timeframe, limit=BTC_CORRELATION_LOOKBACK + 5)
+        # closed_only باید با symbol_df یکی باشه، وگرنه بازده‌ها یه کندل جابه‌جا مقایسه می‌شن
+        btc_df = await client.fetch_ohlcv_df(BTC_SYMBOL, timeframe, limit=BTC_CORRELATION_LOOKBACK + 5,
+                                             closed_only=closed_only)
         if symbol_df is None:
-            symbol_df = await client.fetch_ohlcv_df(symbol, timeframe, limit=BTC_CORRELATION_LOOKBACK + 5)
+            symbol_df = await client.fetch_ohlcv_df(symbol, timeframe, limit=BTC_CORRELATION_LOOKBACK + 5,
+                                                    closed_only=closed_only)
         else:
             symbol_df = symbol_df.tail(BTC_CORRELATION_LOOKBACK + 5).reset_index(drop=True)
     except Exception:

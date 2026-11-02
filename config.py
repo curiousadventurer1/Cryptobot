@@ -173,6 +173,10 @@ CONTEXT_HISTORICAL_WIN_RATE_BONUS_THRESHOLD = 60
 CONTEXT_HISTORICAL_WIN_RATE_PENALTY_THRESHOLD = 40
 CONTEXT_HISTORICAL_PERFORMANCE_BONUS = 6
 CONTEXT_HISTORICAL_PERFORMANCE_PENALTY = 10
+# فاز ۳ - عملکرد تاریخی بر پایه‌ی میانگین R (engine_history_v2)
+HISTORY_MIN_SAMPLES = 20        # حداقل سیگنال یکتای به‌نتیجه‌رسیده (۵ تا از نظر آماری خیلی پرنوسان بود)
+HISTORY_PRIOR_STRENGTH = 10     # کشش به سمت صفر: shrunk = جمع R / (n + این عدد)
+HISTORY_POINTS_PER_R = 10       # هر +۱R میانگین (پس از کشش) = +۱۰ واحد اطمینان، با سقف BONUS/PENALTY بالا
 
 # ---------- فاز ۲ تقویت موتور سیگنال: ادفام هم‌جهتی چندتایم‌فریمی ----------
 # علاوه بر تایم‌فریم بالاتر اول، یه تایم‌فریم حتی بالاتر (دومی) هم چک می‌شه

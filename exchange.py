@@ -9,7 +9,7 @@ import time
 import ccxt.async_support as ccxt
 import pandas as pd
 from config import EXCHANGE_ID
-from market_data_validation import ohlcv_frame_from_raw
+from market_data_validation import ohlcv_frame_from_raw, drop_unclosed_candle
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,8 @@ class ExchangeClient:
     async def close(self):
         return None
 
-    async def fetch_ohlcv_df(self, symbol: str, timeframe: str, limit: int = 100) -> pd.DataFrame:
+    async def fetch_ohlcv_df(self, symbol: str, timeframe: str, limit: int = 100,
+                             closed_only: bool = False) -> pd.DataFrame:
         """
         دریافت کندل‌ها و تبدیل به DataFrame
         ستون‌ها: timestamp, open, high, low, close, volume
@@ -84,8 +85,15 @@ class ExchangeClient:
         حذف یا اصلاح نمی‌شود و تحلیل با خطای کنترل‌شده متوقف می‌شود.
         از پاسخ معتبر، حداکثر آخرین `limit` کندل انتخاب می‌شود.
         """
-        raw = await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        return ohlcv_frame_from_raw(raw, limit=limit)
+        if not closed_only:
+            raw = await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            return ohlcv_frame_from_raw(raw, limit=limit)
+        # closed_only: یه کندل بیشتر می‌گیریم تا بعد از حذف کندل در حال
+        # شکل‌گیری، باز هم `limit` کندل بسته‌شده داشته باشیم
+        raw = await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit + 1)
+        df = ohlcv_frame_from_raw(raw, limit=limit + 1)
+        df = drop_unclosed_candle(df, timeframe)
+        return df.tail(limit).reset_index(drop=True)
 
     async def fetch_ticker_price(self, symbol: str) -> float:
         ticker = await self.exchange.fetch_ticker(symbol)

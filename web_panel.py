@@ -27,6 +27,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 import database as db
 import backup
+import engine_config
 from config import WEB_PANEL_USERNAME, WEB_PANEL_PASSWORD, BOT_TOKEN
 
 logger = logging.getLogger(__name__)
@@ -345,7 +346,30 @@ SETTINGS_SCHEMA = [
      "بین ۰ تا ۱ - هرچی بزرگ‌تر، سیگنال‌های کمتر ولی مطمئن‌تر"),
     ("atr_sl_mult", "ضریب ATR برای حد ضرر", "1.5", "عدد اعشاری"),
     ("rr_targets", "نسبت‌های ریسک‌به‌ریوارد TP1,TP2,TP3", "1.0,2.0,3.0", "سه عدد با کاما جدا"),
+    # ── فاز ۳: دقت سیگنال (۱ = روشن، ۰ = خاموش) ──
+    ("engine_closed_candles", "تحلیل فقط روی کندل‌های بسته‌شده", "1",
+     "۱ یا ۰ - جلوی تغییر سیگنال وسط کندل (repaint) رو می‌گیره؛ سیگنال تا یک کندل دیرتر میاد"),
+    ("engine_ohlc_tracking", "پایش سیگنال‌ها با سقف/کف کندل‌ها", "1",
+     "۱ یا ۰ - لمس TP/SL بین دو بررسی دیگه جا نمی‌افته (کندل‌های ۵ دقیقه‌ای)"),
+    ("engine_history_v2", "عملکرد تاریخی بر پایه‌ی میانگین R", "1",
+     "۱ یا ۰ - با حداقل ۲۰ نمونه‌ی یکتا و تعدیل آماری؛ ۰ = روش قبلی (نرخ برد خام)"),
+    ("engine_trend_block", "امتیازدهی «بلوک روند»", "0",
+     "۱ یا ۰ - اندیکاتورهای هم‌خانواده‌ی روند یک رأی حساب می‌شن. تا وقتی ۰ هست فقط در لاگ (shadow-scoring) محاسبه می‌شه"),
+    ("backtest_live_model", "بک‌تست با مدل پایش زنده", "1",
+     "۱ یا ۰ - ورود لیمیت، انتظار برای پرشدن، بریک‌ایون بعد از TP1 و کارمزد؛ ۰ = مدل قدیمی"),
+    ("fee_rate_pct", "کارمزد هر طرف معامله (درصد)", "0.1", "بین ۰ تا ۱ - مثلاً 0.1 یعنی ۰٫۱٪"),
+    ("slippage_pct", "لغزش قیمت خروج بازار (درصد)", "0.05", "بین ۰ تا ۱ - برای خروج با SL/تایم‌اوت"),
+    ("fee_filter_max_r", "فیلتر هزینه (حداکثر هزینه بر حسب R)", "0",
+     "بین ۰ تا ۲ - سیگنالی که هزینه‌ی رفت‌وبرگشتش بیشتر از این باشه صادر نمی‌شه؛ ۰ = خاموش"),
+    ("history_v2_since", "شروع تاریخچه‌ی معتبر عملکرد", "",
+     "تاریخ YYYY-MM-DD یا ISO - فقط سیگنال‌های بعد از این تاریخ در «عملکرد تاریخی» حساب می‌شن"),
 ]
+
+_FLAG_SETTING_KEYS = {
+    "engine_closed_candles", "engine_ohlc_tracking", "engine_history_v2",
+    "engine_trend_block", "backtest_live_model",
+}
+_PERCENT_SETTING_RANGES = {"fee_rate_pct": 1.0, "slippage_pct": 1.0, "fee_filter_max_r": 2.0}
 
 
 @app.get("/backups", response_class=HTMLResponse)
@@ -483,6 +507,22 @@ def _validate_setting(key: str, raw: str) -> str | None:
                     and parts[0] < parts[1] < parts[2]):
                 return ",".join(f"{x:g}" for x in parts)
             return None
+        if key in _FLAG_SETTING_KEYS:
+            v = raw.lower()
+            if v in ("1", "true", "on", "yes"):
+                return "1"
+            if v in ("0", "false", "off", "no"):
+                return "0"
+            return None
+        if key in _PERCENT_SETTING_RANGES:
+            v = float(raw)
+            return f"{v:g}" if math.isfinite(v) and 0 <= v <= _PERCENT_SETTING_RANGES[key] else None
+        if key == "history_v2_since":
+            from datetime import datetime
+            parsed = datetime.fromisoformat(raw)
+            if parsed.tzinfo is not None:
+                return None  # بقیه‌ی تاریخ‌های دیتابیس UTC و بدون منطقه‌ی زمانی‌ان
+            return parsed.isoformat()
     except ValueError:
         return None
     return None
@@ -496,6 +536,7 @@ async def update_setting_web(key: str = Form(...), value: str = Form(...), user:
         if cleaned is None:
             return RedirectResponse(f"/settings?error={quote(key)}", status_code=303)
         await db.set_setting(key, cleaned)
+        engine_config.invalidate_cache()
     return RedirectResponse("/settings", status_code=303)
 
 
