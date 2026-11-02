@@ -5,7 +5,7 @@ from telegram.constants import ParseMode
 
 from exchange import ExchangeClient, normalize_symbol
 from backtest import (
-    run_backtest, run_walk_forward_backtest, run_weight_calibration,
+    run_backtest, run_walk_forward_backtest, run_weight_calibration, SimulationSettings,
     DEFAULT_BACKTEST_CANDLES, MAX_BACKTEST_CANDLES, MIN_BACKTEST_CANDLES,
     CALIBRATION_SEGMENTS, CALIBRATION_MIN_TRADES, CALIBRATION_STABILITY_PENALTY_WEIGHT,
 )
@@ -13,10 +13,45 @@ from config import ADMIN_IDS, DEFAULT_SYMBOLS
 from single_analysis import TIMEFRAME_LABELS_FA
 from charts import generate_backtest_chart, generate_backtest_chart_async
 import database as db
+from engine_config import get_engine_config
+
+SCORING_MODE_FA = {"classic": "مدل فعلی", "trend_block": "مدل بلوک روند (آزمایشی)"}
+
+
+async def _simulation_settings(scoring_mode: str | None = None) -> SimulationSettings:
+    """تنظیمات شبیه‌سازی از engine_config (پنل وب) - هم‌سان با رفتار زنده‌ی ربات"""
+    from config import BREAKEVEN_AFTER_TP1
+    cfg = await get_engine_config()
+    return SimulationSettings(
+        live_model=cfg.backtest_live_model,
+        fee_rate=cfg.fee_rate,
+        slippage=cfg.slippage,
+        scoring_mode=scoring_mode or cfg.scoring_mode,
+        breakeven_after_tp1=BREAKEVEN_AFTER_TP1,
+        max_cost_r=cfg.fee_filter_max_r,
+    )
+
+
+def _methodology_text(sim: SimulationSettings) -> str:
+    if sim.live_model:
+        entry = ("ورود با سفارش limit روی نقطه‌ی ورود پیشنهادی (مثل پایش زنده)؛ اگه قیمت قبل از ورود "
+                 "به SL برسه یا اصلاً به نقطه‌ی ورود نرسه، معامله رد می‌شه. بعد از TP1 حد ضرر به نقطه‌ی "
+                 "ورود منتقل می‌شه؛ خروج فقط با TP3، SL، سربه‌سر یا پایان دوره")
+    else:
+        entry = "ورود فرضی با قیمت باز شدن کندل بعد از سیگنال (مدل قدیمی)"
+    if sim.fee_rate > 0 or sim.slippage > 0:
+        cost = (f"کارمزد {sim.fee_rate*100:.2f}% هر طرف و لغزش {sim.slippage*100:.2f}% برای خروج‌های "
+                f"بازار از R کم شده")
+    else:
+        cost = "کارمزد/لغزش لحاظ نشده"
+    return (f"⚠️ *روش‌شناسی*: {entry}. اگه توی یه کندل هم SL و هم TP لمس بشن، محافظه‌کارانه فرض "
+            f"می‌کنیم SL اول خورده. {cost}. سربه‌سر جزو برد یا باخت حساب نمی‌شه (مثل /mystats). "
+            f"این شبیه‌سازی تضمین عملکرد آینده نیست.")
 
 EXIT_REASON_FA = {
     "SL": "خورد به حد ضرر",
     "TP3": "رسید به TP3",
+    "BREAKEVEN": "بعد از TP1 به نقطه‌ی ورود (سربه‌سر) برگشت",
     "TP2_TIMEOUT": "تا پایان دوره فقط تا TP2 رسید",
     "TP1_TIMEOUT": "تا پایان دوره فقط تا TP1 رسید",
     "TIMEOUT": "بدون رسیدن به هیچ سطحی، دوره تموم شد",
@@ -28,6 +63,8 @@ ENTRY_SKIP_REASON_FA = {
     "ENTRY_AT_OR_BEYOND_TP1": "ورود روی یا آن‌سوی TP1",
     "INVALID_ACTUAL_GEOMETRY": "هندسه/نسبت R ورود نامعتبر",
     "INVALID_SIGNAL_LEVELS": "خروجی سیگنال نامعتبر",
+    "INVALIDATED_BEFORE_ENTRY": "قبل از ورود از SL رد شد (باطل)",
+    "NOT_FILLED": "قیمت به نقطه‌ی ورود نرسید",
 }
 
 
@@ -82,17 +119,20 @@ def _format_backtest_result(result, title_prefix: str = "📊") -> str:
 
     lines += [
         f"🔢 تعداد معاملات: *{result.total_trades}*" + (f" (+{result.still_open_count} هنوز باز)" if result.still_open_count else ""),
-        f"✅ برد: {result.wins} | ❌ باخت: {result.losses}",
+        f"✅ برد: {result.wins} | ❌ باخت: {result.losses}" + (f" | ⚪️ سربه‌سر: {result.breakevens}" if result.breakevens else ""),
         f"📈 نرخ برد: *{win_rate:.1f}%*" if win_rate is not None else "📈 نرخ برد: -",
         f"⚖️ میانگین R هر معامله: *{avg_r:+.2f}*" if avg_r is not None else "",
-        f"💰 مجموع R: *{result.total_r:+.2f}*",
+        f"💰 مجموع R: *{result.total_r:+.2f}*" + (
+            f" (قبل از کارمزد/لغزش: {result.gross_total_r:+.2f})"
+            if abs(result.gross_total_r - result.total_r) > 1e-9 else ""),
         f"🎯 Profit Factor: *{pf:.2f}*" if pf is not None else "🎯 Profit Factor: بی‌نهایت (بدون ضرر)",
         f"📉 بیشترین باخت‌های پیاپی: {result.max_consecutive_losses}",
     ]
     return "\n".join(l for l in lines if l is not None)
 
 
-def _format_full_backtest_message(result) -> str:
+def _format_full_backtest_message(result, sim: SimulationSettings = None, comparison=None) -> str:
+    sim = sim or SimulationSettings()
     text = _format_backtest_result(result)
 
     lines = [text]
@@ -103,18 +143,26 @@ def _format_full_backtest_message(result) -> str:
         dir_emoji = "🟢" if t.direction == "BUY" else "🔴"
         lines.append(f"{dir_emoji} {t.direction} @ ${_fmt_price(t.entry)} → {reason_fa} (R={t.r_multiple:+.2f})")
 
-    lines += [
-        "",
-        "⚠️ *روش‌شناسی*: ورود فرضی با قیمت باز شدن کندل بعد از سیگنال؛ اگه "
-        "توی یه کندل هم SL و هم TP لمس بشن، محافظه‌کارانه فرض می‌کنیم SL "
-        "اول خورده. ورود روی یا آن‌سوی SL یا TP1 رد می‌شود؛ SL/تارگت‌ها "
-        "برای سازگار کردن گپ جابه‌جا نمی‌شوند. آمار فقط ورودی‌های معتبر است "
-        "و کارمزد/لغزش هنوز لحاظ نشده. این شبیه‌سازی تضمین عملکرد آینده نیست.",
-    ]
+    if comparison is not None:
+        other_mode, other = comparison
+        lines += ["", f"🔬 *مقایسه با {SCORING_MODE_FA.get(other_mode, other_mode)}* (همین داده و تنظیمات):"]
+        if other.total_trades == 0:
+            lines.append("بدون معاملهٔ نهایی‌شده.")
+        else:
+            wr = f"{other.win_rate:.1f}%" if other.win_rate is not None else "-"
+            avg = f"{other.avg_r:+.2f}" if other.avg_r is not None else "-"
+            pf = f"{other.profit_factor:.2f}" if other.profit_factor is not None else "∞"
+            lines.append(f"{other.total_trades} معامله | برد {wr} | میانگین R {avg} | "
+                         f"مجموع R {other.total_r:+.2f} | PF {pf}")
+        lines.append(f"(مدل فعال: {SCORING_MODE_FA.get(sim.scoring_mode, sim.scoring_mode)} — "
+                     f"تغییرش از پنل وب با `engine_trend_block`)")
+
+    lines += ["", _methodology_text(sim)]
     return "\n".join(lines)
 
 
-def _format_walk_forward_message(results: list, symbol: str, timeframe: str) -> str:
+def _format_walk_forward_message(results: list, symbol: str, timeframe: str,
+                                 sim: SimulationSettings = None) -> str:
     tf_label = TIMEFRAME_LABELS_FA.get(timeframe, timeframe)
     lines = [
         f"📊 *بک‌تست پیشرو (Walk-Forward) {symbol} — {tf_label}*",
@@ -152,9 +200,11 @@ def _format_walk_forward_message(results: list, symbol: str, timeframe: str) -> 
     if total == 0:
         lines.append("هیچ معاملهٔ نهایی‌شده‌ای در کل بازه‌ها وجود ندارد.")
     else:
-        wins = sum(1 for t in resolved if t.r_multiple > 0)
+        wins = sum(1 for t in resolved if t.outcome == "win")
+        decided = sum(1 for t in resolved if t.outcome != "breakeven")
         total_r = sum(t.r_multiple for t in resolved)
-        lines.append(f"تعداد کل: {total} | نرخ برد کلی: {wins/total*100:.1f}% | مجموع R: {total_r:+.2f}")
+        wr_txt = f"{wins/decided*100:.1f}%" if decided else "-"
+        lines.append(f"تعداد کل: {total} | نرخ برد کلی: {wr_txt} | مجموع R: {total_r:+.2f}")
 
         win_rates = [r.win_rate for r in results if r.win_rate is not None]
         if len(win_rates) >= 2:
@@ -171,9 +221,10 @@ def _format_walk_forward_message(results: list, symbol: str, timeframe: str) -> 
         "عملکردش کمی محافظه‌کارانه‌تر به‌نظر برسه. تعداد معاملات هر بازه "
         "کمتر از یه بک‌تست کامله (چون داده بین چند بخش تقسیم شده) - برای "
         "نتیجه‌ی آماری قابل‌اتکاتر، بازه‌ی زمانی بیشتری امتحان کن. ورودی "
-        "روی یا آن‌سوی SL/TP1 رد می‌شود؛ آمار فقط ورودی معتبر است و "
-        "کارمزد/لغزش هنوز لحاظ نشده.",
+        "ردشده در آمار برد/باخت نیست.",
     ]
+    if sim is not None:
+        lines += ["", _methodology_text(sim)]
     return "\n".join(lines)
 
 
@@ -212,7 +263,9 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"❌ نماد `{symbol}` روی صرافی پیدا نشد.", parse_mode=ParseMode.MARKDOWN)
             return
 
-        df = await client.fetch_ohlcv_df(symbol, timeframe, limit=candles)
+        engine_cfg = await get_engine_config()
+        df = await client.fetch_ohlcv_df(symbol, timeframe, limit=candles,
+                                         closed_only=engine_cfg.closed_candles)
         if len(df) < MIN_BACKTEST_CANDLES:
             await msg.edit_text(
                 f"⚠️ فقط {len(df)} کندل تاریخچه در دسترسه (حداقل {MIN_BACKTEST_CANDLES} تا لازمه). "
@@ -231,15 +284,16 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except ValueError:
                 rr_targets = None
 
+        sim = await _simulation_settings()
         if walk_forward:
             from config import WALK_FORWARD_SEGMENTS
             results = await asyncio.to_thread(
                 run_walk_forward_backtest,
                 df, symbol, timeframe, segments=WALK_FORWARD_SEGMENTS,
                 confidence_threshold_fraction=confidence_threshold,
-                atr_sl_mult=atr_sl_mult, rr_targets=rr_targets,
+                atr_sl_mult=atr_sl_mult, rr_targets=rr_targets, sim=sim,
             )
-            text = _format_walk_forward_message(results, symbol, timeframe)
+            text = _format_walk_forward_message(results, symbol, timeframe, sim=sim)
             await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
 
             all_trades = [t for r in results for t in r.trades]
@@ -247,13 +301,21 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chart_buf = await generate_backtest_chart_async(all_trades, symbol, f"{timeframe} (Walk-Forward)")
                 await update.message.reply_photo(photo=chart_buf)
         else:
-            result = await asyncio.to_thread(
-                run_backtest,
-                df, symbol, timeframe,
-                confidence_threshold_fraction=confidence_threshold,
-                atr_sl_mult=atr_sl_mult, rr_targets=rr_targets,
-            )
-            text = _format_full_backtest_message(result)
+            other_mode = "classic" if sim.scoring_mode == "trend_block" else "trend_block"
+            from dataclasses import replace as _replace
+            other_sim = _replace(sim, scoring_mode=other_mode)
+
+            def _both():
+                main = run_backtest(df, symbol, timeframe,
+                                    confidence_threshold_fraction=confidence_threshold,
+                                    atr_sl_mult=atr_sl_mult, rr_targets=rr_targets, sim=sim)
+                other = run_backtest(df, symbol, timeframe,
+                                     confidence_threshold_fraction=confidence_threshold,
+                                     atr_sl_mult=atr_sl_mult, rr_targets=rr_targets, sim=other_sim)
+                return main, other
+
+            result, other_result = await asyncio.to_thread(_both)
+            text = _format_full_backtest_message(result, sim=sim, comparison=(other_mode, other_result))
             await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
 
             if result.total_trades > 0:
@@ -338,8 +400,8 @@ def _format_calibration_message(candidates: list, symbols: list, timeframe: str)
     lines.append(
         "⚠️ این فقط یه *گزارشه* — هیچ تنظیمی خودکار اعمال نمی‌شه. "
         "برای اعمال یکی از ترکیب‌های بالا، روی دکمه‌ش بزن. ردشدگی ورودی‌ها "
-        "در امتیاز جریمهٔ جداگانه ندارد؛ آمار فقط معاملات معتبر است و "
-        "کارمزد/لغزش هنوز لحاظ نشده."
+        "در امتیاز جریمهٔ جداگانه ندارد؛ آمار فقط معاملات معتبر است. "
+        "کارمزد/لغزش و مدل ورود طبق تنظیمات پنل وب لحاظ شده."
     )
     return "\n".join(lines)
 
@@ -377,8 +439,13 @@ async def calibrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     candles = CALIBRATION_DEFAULT_CANDLES
     symbol_arg = None
 
+    scoring_override = None
     for a in args:
-        if a.lower() in _KNOWN_TIMEFRAMES:
+        if a.lower() in ("tb", "trend_block"):
+            scoring_override = "trend_block"
+        elif a.lower() == "classic":
+            scoring_override = "classic"
+        elif a.lower() in _KNOWN_TIMEFRAMES:
             timeframe = a.lower()
         elif a.isdigit():
             candles = max(MIN_BACKTEST_CANDLES, min(MAX_BACKTEST_CANDLES, int(a)))
@@ -396,12 +463,15 @@ async def calibrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"با {candles} کندل تاریخی... (ممکنه یکی-دو دقیقه طول بکشه)"
     )
 
+    engine_cfg = await get_engine_config()
+    sim = await _simulation_settings(scoring_override)
     client = ExchangeClient()
     try:
         async def _load(symbol):
             if not await client.validate_symbol(symbol):
                 return None
-            df = await client.fetch_ohlcv_df(symbol, timeframe, limit=candles)
+            df = await client.fetch_ohlcv_df(symbol, timeframe, limit=candles,
+                                             closed_only=engine_cfg.closed_candles)
             return df if len(df) >= MIN_BACKTEST_CANDLES else None
 
         # دریافت هم‌زمان داده‌ی همه‌ی نمادها؛ ترتیب نمادها حفظ می‌شود
@@ -419,9 +489,14 @@ async def calibrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # ده‌ها بک‌تست پشت‌سرهم؛ در ترد جدا تا ربات برای بقیه‌ی کاربران قفل نشه
-        candidates = await asyncio.to_thread(run_weight_calibration, symbol_dfs, segments=CALIBRATION_SEGMENTS)
+        candidates = await asyncio.to_thread(run_weight_calibration, symbol_dfs,
+                                             segments=CALIBRATION_SEGMENTS, sim=sim)
         used_symbols = [s for s, _, _ in symbol_dfs]
         text = _format_calibration_message(candidates, used_symbols, timeframe)
+        text += "\n\n" + f"🧮 مدل امتیازدهی: {SCORING_MODE_FA.get(sim.scoring_mode, sim.scoring_mode)}"
+        if sim.scoring_mode != engine_cfg.scoring_mode:
+            text += ("\n⚠️ این کالیبراسیون برای مدلی غیر از مدل فعاله؛ فقط وقتی اعمالش کن که "
+                     "هم‌زمان `engine_trend_block` رو توی پنل وب عوض می‌کنی.")
         if skipped:
             text = text + "\n\n(نمادهای رد شده به‌خاطر نبود داده‌ی کافی: " + "، ".join(skipped) + ")"
 

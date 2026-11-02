@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
@@ -13,6 +14,8 @@ from market_context import check_higher_timeframe_alignment, check_second_higher
 from fundamentals import get_coin_fundamentals, get_market_fundamentals
 import database as db
 import analytics
+
+logger = logging.getLogger(__name__)
 
 
 # ---------- کیبوردهای شیشه‌ای ----------
@@ -138,7 +141,7 @@ def _format_single_result(result, higher_tf_info: dict = None, btc_corr_info: di
     lines = [
         f"💎 {result.symbol}",
         f"{meta['emoji']} {meta['fa']}",
-        f"🕰 تایم‌فریم: {tf_label}",
+        f"🕰 تایم‌فریم: {tf_label}" + (" (بر پایه‌ی آخرین کندل بسته‌شده)" if result.closed_candle_basis else ""),
         f"📊 اطمینان: {displayed_confidence}% (امتیاز {result.score:+.1f} از {result.max_score:.0f})",
         f"🧭 جهت: {meta['compass']}",
         f"💪 قدرت روند (ADX): {trend_strength}",
@@ -237,6 +240,8 @@ def _format_single_result(result, higher_tf_info: dict = None, btc_corr_info: di
             rr = abs(tp - result.entry) / result.risk if result.risk else 0
             lines.append(f"• TP{i} (۱:{rr:.1f}): ${_fmt_price(tp)}")
         lines.append("ℹ️ بعد از رسیدن به TP1، حد ضرر خودکار به نقطه‌ی سربه‌سر منتقل می‌شه (اگه پیگیریش کنی).")
+        if result.cost_r:
+            lines.append(f"💸 هزینه‌ی تقریبی کارمزد + لغزش: ~{result.cost_r:.2f}R از ریسک این معامله")
 
         if position_size:
             vol_note = " (به‌خاطر نوسان بالای بازار، حجم کاهش داده شد ⚠️)" if position_size.get("volatility_adjusted") else ""
@@ -280,13 +285,26 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
         "قیمت‌ها باید مثبت و متناهی و ترتیب Entry، SL و سه تارگت صحیح باشد.\n"
         "سیگنال قابل‌پیگیری صادر نشد و برای پایش ثبت نشده است؛ داده و تنظیمات را بررسی کن."
     )
+    from engine_config import get_engine_config
+    engine_cfg = await get_engine_config()
     client = ExchangeClient()
     try:
         if not await client.validate_symbol(symbol):
             return None, None, None
 
+        # کندل‌ها و تیکر هم‌زمان؛ تیکر برای قیمت لحظه‌ای ورود/SL (وقتی رأی‌ها
+        # روی کندل بسته حساب می‌شن) و نقدینگی ۲۴ساعته
+        ohlcv_res, ticker_res = await asyncio.gather(
+            client.fetch_ohlcv_df(symbol, timeframe, limit=MIN_CANDLES_FOR_ANALYSIS,
+                                  closed_only=engine_cfg.closed_candles),
+            client.exchange.fetch_ticker(symbol),
+            return_exceptions=True,
+        )
+        ticker = None if isinstance(ticker_res, BaseException) else ticker_res
         try:
-            df = await client.fetch_ohlcv_df(symbol, timeframe, limit=MIN_CANDLES_FOR_ANALYSIS)
+            if isinstance(ohlcv_res, BaseException):
+                raise ohlcv_res
+            df = ohlcv_res
             validate_ohlcv_frame(df)
         except MarketDataError as error:
             return market_data_warning(error), None, None
@@ -317,15 +335,30 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
             except ValueError:
                 return invalid_output_message, None, None
 
+        live_price = None
+        if engine_cfg.closed_candles and ticker:
+            live_price = ticker.get("last")
+
         try:
             result = await asyncio.to_thread(
                 build_single_result, df, symbol, timeframe,
                 confidence_threshold_fraction=confidence_threshold,
                 atr_sl_mult=atr_sl_mult, rr_targets=rr_targets,
+                live_price=live_price, scoring_mode=engine_cfg.scoring_mode,
+                fee_rate=engine_cfg.fee_rate, slippage=engine_cfg.slippage,
+                max_cost_r=engine_cfg.fee_filter_max_r,
             )
             validate_signal_output(result.direction, result.price, result.entry, result.sl, result.tps)
         except TradeGeometryError:
             return invalid_output_message, None, None
+        result.closed_candle_basis = engine_cfg.closed_candles
+        if result.shadow:
+            # امتیازدهی سایه: برای مقایسه‌ی مدل فعلی و مدل دیگه روی سیگنال‌های واقعی
+            logger.info(
+                "shadow-scoring %s %s active=%s:%s(%.2f/%.2f) shadow=%s:%s(%.2f/%.2f)",
+                symbol, timeframe, result.scoring_mode, result.direction, result.score, result.max_score,
+                result.shadow["mode"], result.shadow["direction"], result.shadow["score"], result.shadow["max_score"],
+            )
 
         # ---- همهٔ داده‌های جانبی هم‌زمان (قبلاً ~۱۰ درخواست پشت‌سرهم بود) ----
         # هر مورد مستقل و best-effort است: خطای هرکدوم فقط همون بخش رو None می‌کنه.
@@ -339,13 +372,22 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
             news_items = await news_module.get_combined_news(crypto_limit=4, forex_limit=2)
             return news_module.format_brief_for_signal(news_items, max_items=2)
 
-        tasks = {"ticker": client.exchange.fetch_ticker(symbol), "news": _news_brief()}
+        closed = engine_cfg.closed_candles
+        tasks = {"news": _news_brief()}
         if is_directional:
-            tasks["htf"] = check_higher_timeframe_alignment(client, symbol, timeframe, result.direction)
-            tasks["htf2"] = check_second_higher_timeframe_alignment(client, symbol, timeframe, result.direction)
-            tasks["btc"] = check_btc_correlation(client, symbol, timeframe, symbol_df=df)
+            tasks["htf"] = check_higher_timeframe_alignment(client, symbol, timeframe, result.direction,
+                                                            closed_only=closed)
+            tasks["htf2"] = check_second_higher_timeframe_alignment(client, symbol, timeframe, result.direction,
+                                                                    closed_only=closed)
+            tasks["btc"] = check_btc_correlation(client, symbol, timeframe, symbol_df=df, closed_only=closed)
             tasks["orderbook"] = client.fetch_order_book_imbalance(symbol, depth=ORDER_BOOK_DEPTH_LEVELS)
-            tasks["history"] = analytics.get_historical_performance(symbol, timeframe, result.direction)
+            if engine_cfg.history_v2:
+                tasks["history"] = analytics.get_historical_performance_v2(
+                    symbol, timeframe, result.direction, since=engine_cfg.history_since,
+                    fee_rate=engine_cfg.fee_rate, slippage=engine_cfg.slippage,
+                )
+            else:
+                tasks["history"] = analytics.get_historical_performance(symbol, timeframe, result.direction)
         if FUNDAMENTALS_ENABLED:
             tasks["coin"] = get_coin_fundamentals(symbol)
             tasks["market"] = get_market_fundamentals()
@@ -356,7 +398,6 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
         ctx = {key: (None if isinstance(value, BaseException) else value)
                for key, value in zip(tasks, gathered)}
 
-        ticker = ctx.get("ticker")
         if ticker:
             try:
                 result.quote_volume_24h = float(ticker.get("quoteVolume") or 0.0)
