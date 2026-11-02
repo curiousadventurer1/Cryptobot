@@ -19,6 +19,7 @@ import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
+from telegram.helpers import escape_markdown
 from config import ADMIN_IDS
 import database as db
 import analytics
@@ -67,6 +68,16 @@ ADMIN_HELP_TEXT = """
 """
 
 
+def _md(text) -> str:
+    """
+    Escape متنِ واردشده توسط کاربر (یوزرنیم، نام، دلیل، یادداشت) برای Markdown.
+    بدون این، یه نام مثل john_doe کل پیام رو با خطای parse خراب می‌کرد
+    (مثلاً نوتیف درخواست دسترسی اصلاً به ادمین نمی‌رسید) و یه نام دست‌ساز
+    می‌تونست لینک فیشینگ داخل پیام ادمین بسازه.
+    """
+    return escape_markdown("" if text is None else str(text), version=1)
+
+
 def _is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -93,7 +104,7 @@ async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await db.block_user(target_id, reason)
-    await update.message.reply_text(f"🚫 کاربر `{target_id}` مسدود شد.\nدلیل: {reason}", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"🚫 کاربر `{target_id}` مسدود شد.\nدلیل: {_md(reason)}", parse_mode=ParseMode.MARKDOWN)
 
 
 async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -123,7 +134,7 @@ async def blocklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["🚫 *کاربران مسدودشده:*", ""]
     for b in blocked:
-        lines.append(f"• `{b['user_id']}` — {b['reason']} ({b['blocked_at'][:10]})")
+        lines.append(f"• `{b['user_id']}` — {_md(b['reason'])} ({b['blocked_at'][:10]})")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
@@ -272,7 +283,7 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             flags += " 🚫"
         if u["is_whitelisted"]:
             flags += " ✅"
-        uname = u["username"] or "بدون‌نام"
+        uname = _md(u["username"] or "بدون‌نام")
         lines.append(f"• `{u['user_id']}` — {uname}{flags} — {u['joined_at'][:10]}")
 
     if total_pages > 1:
@@ -295,7 +306,7 @@ async def finduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ کاربری با شناسه‌ی `{target_id}` پیدا نشد.", parse_mode=ParseMode.MARKDOWN)
         return
 
-    uname = profile["username"] or "بدون‌نام"
+    uname = _md(profile["username"] or "بدون‌نام")
     lines = [
         f"👤 *پروفایل کاربر*",
         f"شناسه: `{profile['user_id']}`",
@@ -303,7 +314,7 @@ async def finduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"تاریخ عضویت: {profile['joined_at'][:10]}",
         f"اسکن خودکار: {'فعال' if profile['auto_scan_enabled'] else 'غیرفعال'}",
         f"تعداد واچ‌لیست: {profile['watchlist_count']}",
-        f"وضعیت مسدودی: {'🚫 مسدود — ' + profile['block_reason'] if profile['is_blocked'] else '✅ آزاد'}",
+        f"وضعیت مسدودی: {'🚫 مسدود — ' + _md(profile['block_reason']) if profile['is_blocked'] else '✅ آزاد'}",
         f"لیست سفید: {'✅ عضو' if profile['is_whitelisted'] else '❌ نیست'}",
     ]
     if target_id in ADMIN_IDS:
@@ -354,8 +365,8 @@ async def whitelist_list_command(update: Update, context: ContextTypes.DEFAULT_T
 
     lines = ["✅ *لیست سفید:*", ""]
     for w in wl:
-        uname = w["username"] or "بدون‌نام"
-        note_part = f" — {w['note']}" if w["note"] else ""
+        uname = _md(w["username"] or "بدون‌نام")
+        note_part = f" — {_md(w['note'])}" if w["note"] else ""
         lines.append(f"• `{w['user_id']}` — {uname}{note_part}")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
@@ -440,7 +451,7 @@ async def notify_admins_of_access_request(context: ContextTypes.DEFAULT_TYPE, us
     if not ADMIN_IDS:
         return
 
-    uname = user.username or user.first_name or "بدون‌نام"
+    uname = _md(user.username or user.first_name or "بدون‌نام")
     text = (
         f"🔔 *درخواست دسترسی جدید*\n\n"
         f"شناسه: `{user.id}`\n"

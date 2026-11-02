@@ -1,5 +1,6 @@
 from telegram import Update
 from telegram.ext import ContextTypes
+from telegram.error import BadRequest
 from config import ADMIN_IDS
 import database as db
 
@@ -65,6 +66,20 @@ PENDING_APPROVAL_TEXT = """
 """
 
 
+async def _reply_markdown_safe(update: Update, text: str):
+    """
+    پیام خوش‌آمد سفارشیِ ادمین ممکنه Markdown نامعتبر داشته باشه (مثلاً
+    @my_channel با یه _ تنها). قبلاً این باعث می‌شد /start برای همه‌ی
+    کاربرها خطا بده؛ حالا اگه parse نشد، همون متن بدون فرمت فرستاده می‌شه.
+    """
+    try:
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except BadRequest as e:
+        if "parse" not in str(e).lower():
+            raise
+        await update.message.reply_text(text)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     custom_message = await db.get_setting("custom_welcome_message", "")
@@ -82,11 +97,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # دسترسی نداره. اگه ادمین پیامی تنظیم نکرده، از متن پیش‌فرض
         # «منتظر تایید» استفاده می‌شه.
         text = custom_message if custom_message else PENDING_APPROVAL_TEXT
-        await update.message.reply_text(text, parse_mode="Markdown")
+        await _reply_markdown_safe(update, text)
         return
 
     text = f"📢 {custom_message}\n\n{WELCOME_TEXT}" if custom_message else WELCOME_TEXT
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await _reply_markdown_safe(update, text)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
