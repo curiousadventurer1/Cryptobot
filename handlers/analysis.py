@@ -1,3 +1,4 @@
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
@@ -7,7 +8,7 @@ from single_analysis import (
     add_extended_indicators, build_single_result, apply_context_confluence, TIMEFRAME_LABELS_FA,
     MIN_CANDLES_FOR_ANALYSIS, MIN_CANDLES_REQUIRED
 )
-from charts import generate_extended_chart
+from charts import generate_extended_chart, generate_extended_chart_async
 from market_context import check_higher_timeframe_alignment, check_second_higher_timeframe_alignment, check_btc_correlation
 from fundamentals import get_coin_fundamentals, get_market_fundamentals
 import database as db
@@ -300,7 +301,8 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
             return warn_text, None, None
 
         try:
-            df = add_extended_indicators(df)
+            # محاسبهٔ اندیکاتورها CPU-bound است؛ در ترد جدا تا event loop قفل نشه
+            df = await asyncio.to_thread(add_extended_indicators, df)
         except MarketDataError as error:
             return market_data_warning(error), None, None
 
@@ -316,51 +318,59 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
                 return invalid_output_message, None, None
 
         try:
-            result = build_single_result(
-                df, symbol, timeframe,
+            result = await asyncio.to_thread(
+                build_single_result, df, symbol, timeframe,
                 confidence_threshold_fraction=confidence_threshold,
-                atr_sl_mult=atr_sl_mult, rr_targets=rr_targets
+                atr_sl_mult=atr_sl_mult, rr_targets=rr_targets,
             )
             validate_signal_output(result.direction, result.price, result.entry, result.sl, result.tps)
         except TradeGeometryError:
             return invalid_output_message, None, None
 
-        try:
-            ticker = await client.exchange.fetch_ticker(symbol)
-            result.quote_volume_24h = float(ticker.get("quoteVolume") or 0.0)
-            result.price_change_24h_percent = float(ticker.get("percentage") or 0.0)
-            result.liquidity_level = _classify_liquidity(result.quote_volume_24h)
-        except Exception:
-            pass
+        # ---- همهٔ داده‌های جانبی هم‌زمان (قبلاً ~۱۰ درخواست پشت‌سرهم بود) ----
+        # هر مورد مستقل و best-effort است: خطای هرکدوم فقط همون بخش رو None می‌کنه.
+        from config import FUNDAMENTALS_ENABLED, ORDER_BOOK_DEPTH_LEVELS
+        is_directional = result.direction != "NEUTRAL"
 
-        higher_tf_info = None
-        second_higher_tf_info = None
-        btc_corr_info = None
-        order_book_info = None
-        historical_performance_info = None
-        if result.direction != "NEUTRAL":
+        async def _news_brief():
+            if user_id is None or not await db.get_user_news_enabled(user_id):
+                return None
+            import news as news_module
+            news_items = await news_module.get_combined_news(crypto_limit=4, forex_limit=2)
+            return news_module.format_brief_for_signal(news_items, max_items=2)
+
+        tasks = {"ticker": client.exchange.fetch_ticker(symbol), "news": _news_brief()}
+        if is_directional:
+            tasks["htf"] = check_higher_timeframe_alignment(client, symbol, timeframe, result.direction)
+            tasks["htf2"] = check_second_higher_timeframe_alignment(client, symbol, timeframe, result.direction)
+            tasks["btc"] = check_btc_correlation(client, symbol, timeframe, symbol_df=df)
+            tasks["orderbook"] = client.fetch_order_book_imbalance(symbol, depth=ORDER_BOOK_DEPTH_LEVELS)
+            tasks["history"] = analytics.get_historical_performance(symbol, timeframe, result.direction)
+        if FUNDAMENTALS_ENABLED:
+            tasks["coin"] = get_coin_fundamentals(symbol)
+            tasks["market"] = get_market_fundamentals()
+        if user_id is not None and is_directional:
+            tasks["risk"] = db.get_user_risk(user_id)
+
+        gathered = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        ctx = {key: (None if isinstance(value, BaseException) else value)
+               for key, value in zip(tasks, gathered)}
+
+        ticker = ctx.get("ticker")
+        if ticker:
             try:
-                higher_tf_info = await check_higher_timeframe_alignment(client, symbol, timeframe, result.direction)
-            except Exception:
-                pass
-            try:
-                second_higher_tf_info = await check_second_higher_timeframe_alignment(client, symbol, timeframe, result.direction)
-            except Exception:
-                pass
-            try:
-                btc_corr_info = await check_btc_correlation(client, symbol, timeframe)
-            except Exception:
-                pass
-            try:
-                from config import ORDER_BOOK_DEPTH_LEVELS
-                order_book_info = await client.fetch_order_book_imbalance(symbol, depth=ORDER_BOOK_DEPTH_LEVELS)
-            except Exception:
-                pass
-            try:
-                historical_performance_info = await analytics.get_historical_performance(symbol, timeframe, result.direction)
+                result.quote_volume_24h = float(ticker.get("quoteVolume") or 0.0)
+                result.price_change_24h_percent = float(ticker.get("percentage") or 0.0)
+                result.liquidity_level = _classify_liquidity(result.quote_volume_24h)
             except Exception:
                 pass
 
+        higher_tf_info = ctx.get("htf")
+        second_higher_tf_info = ctx.get("htf2")
+        btc_corr_info = ctx.get("btc")
+        order_book_info = ctx.get("orderbook")
+        historical_performance_info = ctx.get("history")
+        if is_directional:
             result = apply_context_confluence(
                 result, higher_tf_info, btc_corr_info, order_book_info, historical_performance_info,
                 second_higher_tf_info=second_higher_tf_info,
@@ -371,23 +381,12 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
                 return invalid_output_message, None, None
 
         # فاندامنتال (منابع رایگان، best-effort - اگه در دسترس نبود، فقط حذف می‌شه از پیام)
-        coin_fundamentals = None
-        market_fundamentals = None
-        from config import FUNDAMENTALS_ENABLED
-        if FUNDAMENTALS_ENABLED:
-            try:
-                coin_fundamentals = await get_coin_fundamentals(symbol)
-            except Exception:
-                pass
-            try:
-                market_fundamentals = await get_market_fundamentals()
-            except Exception:
-                pass
+        coin_fundamentals = ctx.get("coin")
+        market_fundamentals = ctx.get("market")
 
         position_size = None
-        if user_id is not None and result.direction != "NEUTRAL":
-            risk_settings = await db.get_user_risk(user_id)
-            position_size = _calc_position_size(risk_settings, result.entry, result.sl, result.volatility_risk_mult)
+        if user_id is not None and is_directional:
+            position_size = _calc_position_size(ctx.get("risk"), result.entry, result.sl, result.volatility_risk_mult)
 
         await db.log_signal(
             symbol, result.direction, result.context_adjusted_confidence_percent, result.price,
@@ -397,7 +396,7 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
         # به‌جای ثبت خودکار برای پایش، فقط یه رکورد موقت می‌سازیم و از
         # کاربر با دکمه می‌پرسیم که واقعاً می‌خواد پیگیریش کنه یا نه
         pending_id = None
-        if user_id is not None and result.direction != "NEUTRAL":
+        if user_id is not None and is_directional:
             pending_id = await db.create_pending_signal(
                 user_id, symbol, timeframe, result.direction, result.entry, result.sl, result.tps
             )
@@ -408,17 +407,8 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
             second_higher_tf_info=second_higher_tf_info,
         )
         # اخبار مهم (اگه کاربر الزام نکرده) - خلاصه کوتاه زیر سیگنال
-        if user_id is not None:
-            try:
-                news_enabled = await db.get_user_news_enabled(user_id)
-                if news_enabled:
-                    import news as news_module
-                    news_items = await news_module.get_combined_news(crypto_limit=4, forex_limit=2)
-                    brief = news_module.format_brief_for_signal(news_items, max_items=2)
-                    if brief:
-                        text += brief
-            except Exception:
-                pass
+        if ctx.get("news"):
+            text += ctx["news"]
         levels = None
         if result.direction != "NEUTRAL":
             levels = {"entry": result.entry, "sl": result.sl, "tps": result.tps}
@@ -427,7 +417,7 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
                 diff = result.resistance - result.support
                 if diff > 0:
                     levels["fib_levels"] = {f: result.resistance - diff * f for f in FIBONACCI_LEVELS}
-        chart_buf = generate_extended_chart(df, symbol, timeframe, levels=levels)
+        chart_buf = await generate_extended_chart_async(df, symbol, timeframe, levels=levels)
         keyboard = _result_keyboard(symbol, timeframe, pending_id=pending_id)
         return text, chart_buf, keyboard
     finally:
@@ -486,8 +476,8 @@ async def _send_basic_chart(message, symbol: str, timeframe: str):
             await msg.edit_text(f"❌ نماد `{symbol}` پیدا نشد.", parse_mode=ParseMode.MARKDOWN)
             return
         df = await client.fetch_ohlcv_df(symbol, timeframe, limit=100)
-        df = add_extended_indicators(df)
-        chart_buf = generate_extended_chart(df, symbol, timeframe)
+        df = await asyncio.to_thread(add_extended_indicators, df)
+        chart_buf = await generate_extended_chart_async(df, symbol, timeframe)
         await message.reply_photo(photo=chart_buf)
         await msg.delete()
     except MarketDataError as error:
@@ -528,13 +518,15 @@ async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     client = ExchangeClient()
     lines = []
     try:
-        for symbol in DEFAULT_SYMBOLS:
-            try:
-                result = await analyze_symbol(client, symbol)
-                emoji = SIGNAL_EMOJI[result.signal_type]
-                lines.append(f"{emoji} *{symbol}*: {SIGNAL_FA[result.signal_type]} (`{result.total_score}`)")
-            except Exception:
+        results = await asyncio.gather(
+            *(analyze_symbol(client, symbol) for symbol in DEFAULT_SYMBOLS), return_exceptions=True
+        )
+        for symbol, result in zip(DEFAULT_SYMBOLS, results):
+            if isinstance(result, Exception):
                 lines.append(f"⚠️ {symbol}: خطا در دریافت داده")
+                continue
+            emoji = SIGNAL_EMOJI[result.signal_type]
+            lines.append(f"{emoji} *{symbol}*: {SIGNAL_FA[result.signal_type]} (`{result.total_score}`)")
         lines.append("\nℹ️ برای تحلیل دقیق با نقطه ورود/SL/TP از `/signal SYMBOL` استفاده کن.")
         await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     finally:

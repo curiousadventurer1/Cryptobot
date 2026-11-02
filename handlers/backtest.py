@@ -1,3 +1,4 @@
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
@@ -10,7 +11,7 @@ from backtest import (
 )
 from config import ADMIN_IDS, DEFAULT_SYMBOLS
 from single_analysis import TIMEFRAME_LABELS_FA
-from charts import generate_backtest_chart
+from charts import generate_backtest_chart, generate_backtest_chart_async
 import database as db
 
 EXIT_REASON_FA = {
@@ -232,7 +233,8 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if walk_forward:
             from config import WALK_FORWARD_SEGMENTS
-            results = run_walk_forward_backtest(
+            results = await asyncio.to_thread(
+                run_walk_forward_backtest,
                 df, symbol, timeframe, segments=WALK_FORWARD_SEGMENTS,
                 confidence_threshold_fraction=confidence_threshold,
                 atr_sl_mult=atr_sl_mult, rr_targets=rr_targets,
@@ -242,10 +244,11 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             all_trades = [t for r in results for t in r.trades]
             if any(r.total_trades > 0 for r in results):
-                chart_buf = generate_backtest_chart(all_trades, symbol, f"{timeframe} (Walk-Forward)")
+                chart_buf = await generate_backtest_chart_async(all_trades, symbol, f"{timeframe} (Walk-Forward)")
                 await update.message.reply_photo(photo=chart_buf)
         else:
-            result = run_backtest(
+            result = await asyncio.to_thread(
+                run_backtest,
                 df, symbol, timeframe,
                 confidence_threshold_fraction=confidence_threshold,
                 atr_sl_mult=atr_sl_mult, rr_targets=rr_targets,
@@ -254,7 +257,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
 
             if result.total_trades > 0:
-                chart_buf = generate_backtest_chart(result.trades, symbol, timeframe)
+                chart_buf = await generate_backtest_chart_async(result.trades, symbol, timeframe)
                 await update.message.reply_photo(photo=chart_buf)
 
     except Exception as e:
@@ -395,26 +398,28 @@ async def calibrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     client = ExchangeClient()
     try:
+        async def _load(symbol):
+            if not await client.validate_symbol(symbol):
+                return None
+            df = await client.fetch_ohlcv_df(symbol, timeframe, limit=candles)
+            return df if len(df) >= MIN_BACKTEST_CANDLES else None
+
+        # دریافت هم‌زمان داده‌ی همه‌ی نمادها؛ ترتیب نمادها حفظ می‌شود
+        loaded = await asyncio.gather(*(_load(symbol) for symbol in symbols), return_exceptions=True)
         symbol_dfs = []
         skipped = []
-        for symbol in symbols:
-            try:
-                if not await client.validate_symbol(symbol):
-                    skipped.append(symbol)
-                    continue
-                df = await client.fetch_ohlcv_df(symbol, timeframe, limit=candles)
-                if len(df) < MIN_BACKTEST_CANDLES:
-                    skipped.append(symbol)
-                    continue
-                symbol_dfs.append((symbol, timeframe, df))
-            except Exception:
+        for symbol, df in zip(symbols, loaded):
+            if df is None or isinstance(df, BaseException):
                 skipped.append(symbol)
+            else:
+                symbol_dfs.append((symbol, timeframe, df))
 
         if not symbol_dfs:
             await msg.edit_text("❌ هیچ داده‌ی معتبری برای هیچ‌کدوم از نمادها پیدا نشد.")
             return
 
-        candidates = run_weight_calibration(symbol_dfs, segments=CALIBRATION_SEGMENTS)
+        # ده‌ها بک‌تست پشت‌سرهم؛ در ترد جدا تا ربات برای بقیه‌ی کاربران قفل نشه
+        candidates = await asyncio.to_thread(run_weight_calibration, symbol_dfs, segments=CALIBRATION_SEGMENTS)
         used_symbols = [s for s, _, _ in symbol_dfs]
         text = _format_calibration_message(candidates, used_symbols, timeframe)
         if skipped:
