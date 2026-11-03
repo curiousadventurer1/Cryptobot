@@ -419,7 +419,7 @@ async def setwelcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     message_text = update.message.text.split(None, 1)[1]  # همه‌چیز بعد از /setwelcome (فاصله‌ها رو حفظ می‌کنه)
     await db.set_setting("custom_welcome_message", message_text)
-    await update.message.reply_text("✅ پیام خوش‌آمدگویی سفارشی ثبت شد. با `/getwelcome` می‌تونی ببینیش.")
+    await update.message.reply_text("✅ پیام خوش‌آمدگویی سفارشی ثبت شد. با /getwelcome می‌تونی ببینیش.")
 
 
 async def removewelcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

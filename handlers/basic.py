@@ -7,6 +7,8 @@ import database as db
 WELCOME_TEXT = """
 🤖 *به ربات تحلیل و سیگنال ارز دیجیتال خوش اومدی!*
 
+💡 همه‌ی این‌ها توی منوی دکمه‌ای هم هستن: /menu یا دکمه‌ی «📋 منو» پایین صفحه.
+
 📋 *دستورات:*
 `/signal BTCUSDT` — اول تایم‌فریم رو انتخاب می‌کنی، بعد تحلیل کامل با
 سیگنال خرید/فروش، درصد اطمینان، نقطه ورود، حد ضرر/سود (SL/TP) و نمودار
@@ -47,11 +49,22 @@ Profit Factor) + نمودار منحنی تجمعی بهت می‌ده — تا 
 `/top` — مرور سریع چند ارز پرطرفدار (چندتایم‌فریمی، برای دید کلی)
 `/news` — اخبار مهم کریپتو و فارکس به فارسی، هر خبر با درصد تاثیر و خلاصه فارسی
 `/newssettings` — تنظیمات اخبار: نمایش زیر سیگنال‌ها / ارسال خودکار اخبار خیلی مهم
+`/menu` — منوی دکمه‌ای
 `/help` — نمایش همین راهنما
 
 زیر هر پیام سیگنال دکمه داری برای: 🔄 بروزرسانی، ⏱ تغییر تایم‌فریم،
 ⭐ افزودن به واچ‌لیست، 💰 قیمت لحظه‌ای، و (اگه سیگنال قطعی بود) 📌 پیگیری
 این سیگنال — با این دکمه از من می‌پرسی که وضعیتش رو برات دنبال کنم یا نه.
+
+⚠️ این ربات صرفاً یک ابزار تحلیل تکنیکاله و توصیه‌ی مالی نیست.
+"""
+
+START_TEXT = """
+🤖 *به ربات تحلیل و سیگنال ارز دیجیتال خوش اومدی!*
+
+از منوی دکمه‌ای زیر یکی رو انتخاب کن؛ روی هر دکمه بزنی، توضیحش بالای
+منو میاد و کارش هم همون لحظه انجام می‌شه. دستورهای متنی (مثل
+`/signal BTCUSDT`) هم مثل قبل کار می‌کنن — راهنمای کاملشون با /help.
 
 ⚠️ این ربات صرفاً یک ابزار تحلیل تکنیکاله و توصیه‌ی مالی نیست.
 """
@@ -66,18 +79,18 @@ PENDING_APPROVAL_TEXT = """
 """
 
 
-async def _reply_markdown_safe(update: Update, text: str):
+async def _reply_markdown_safe(update: Update, text: str, reply_markup=None):
     """
     پیام خوش‌آمد سفارشیِ ادمین ممکنه Markdown نامعتبر داشته باشه (مثلاً
     @my_channel با یه _ تنها). قبلاً این باعث می‌شد /start برای همه‌ی
     کاربرها خطا بده؛ حالا اگه parse نشد، همون متن بدون فرمت فرستاده می‌شه.
     """
     try:
-        await update.message.reply_text(text, parse_mode="Markdown")
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
     except BadRequest as e:
         if "parse" not in str(e).lower():
             raise
-        await update.message.reply_text(text)
+        await update.message.reply_text(text, reply_markup=reply_markup)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -100,8 +113,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_markdown_safe(update, text)
         return
 
-    text = f"📢 {custom_message}\n\n{WELCOME_TEXT}" if custom_message else WELCOME_TEXT
-    await _reply_markdown_safe(update, text)
+    from handlers.menu import reply_menu_keyboard, main_menu_keyboard, MENU_HEADER
+    context.user_data.pop("menu_input", None)
+    text = f"📢 {custom_message}\n\n{START_TEXT}" if custom_message else START_TEXT
+    # پیام اول: خوش‌آمد + دکمه‌ی ثابت «📋 منو» پایین صفحه؛ پیام دوم: منوی شیشه‌ای
+    await _reply_markdown_safe(update, text, reply_markup=reply_menu_keyboard())
+    await update.message.reply_text(MENU_HEADER, parse_mode="Markdown",
+                                    reply_markup=main_menu_keyboard(user.id))
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
