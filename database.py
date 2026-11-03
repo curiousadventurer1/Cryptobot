@@ -437,6 +437,14 @@ async def set_auto_scan(user_id: int, enabled: bool):
         await db.commit()
 
 
+async def get_auto_scan(user_id: int) -> bool:
+    """وضعیت اسکن خودکار کاربر (پیش‌فرض جدول: روشن)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT auto_scan_enabled FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        return bool(row[0]) if row and row[0] is not None else True
+
+
 async def log_signal(symbol: str, signal_type: str, score: int, price: float, *, source: str):
     """ثبت جدید فقط با منبع صریح؛ امتیاز و نوع سیگنال بازتفسیر نمی‌شوند."""
     if not isinstance(source, str) or source not in SIGNAL_HISTORY_SOURCES:

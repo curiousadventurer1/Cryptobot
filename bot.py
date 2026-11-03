@@ -5,7 +5,11 @@
 import asyncio
 import logging
 from telegram import Update
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, TypeHandler, ApplicationHandlerStop
+from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, TypeHandler, ApplicationHandlerStop,
+    MessageHandler, filters,
+)
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -20,6 +24,7 @@ from handlers.basic import start, help_command
 from handlers.analysis import signal_command, chart_command, price_command, top_command, gainers_command
 from handlers.watchlist import watch_command, unwatch_command, mywatchlist_command, autoscan_command
 from handlers.callbacks import callback_router
+from handlers.menu import menu_command, menu_callback, menu_text_input
 from handlers.risk import setrisk_command, myrisk_command, mystats_command, mysignals_command, myanalytics_command
 from handlers.backtest import backtest_command, calibrate_command
 from handlers.news import news_command, news_settings_command, handle_news_callback
@@ -103,6 +108,7 @@ def build_application() -> Application:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("signal", signal_command))
     app.add_handler(CommandHandler("chart", chart_command))
     app.add_handler(CommandHandler("price", price_command))
@@ -143,8 +149,73 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("getwelcome", getwelcome_command))
 
     app.add_handler(CallbackQueryHandler(handle_news_callback, pattern=r"^news:"))
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^m:"))
     app.add_handler(CallbackQueryHandler(callback_router))
+    # متن معمولی (نه دستور): دکمه‌ی «📋 منو» یا جواب گزینه‌هایی از منو که ورودی خواستن
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_input))
     return app
+
+
+USER_BOT_COMMANDS = [
+    ("start", "📋 منوی اصلی"),
+    ("menu", "📋 منوی دکمه‌ای"),
+    ("signal", "📊 تحلیل و سیگنال یک ارز"),
+    ("backtest", "🧪 بک‌تست موتور سیگنال"),
+    ("chart", "📈 نمودار قیمت"),
+    ("price", "💰 قیمت لحظه‌ای"),
+    ("gainers", "🚀 بیشترین رشد/افت ۲۴ساعته"),
+    ("top", "🔝 مرور ارزهای پرطرفدار"),
+    ("mywatchlist", "⭐ واچ‌لیست من"),
+    ("watch", "➕ افزودن به واچ‌لیست"),
+    ("unwatch", "➖ حذف از واچ‌لیست"),
+    ("autoscan", "🔔 اسکن خودکار on/off"),
+    ("mysignals", "📌 سیگنال‌های پیگیری‌شده"),
+    ("mystats", "🏆 آمار سیگنال‌های من"),
+    ("myanalytics", "🔬 تحلیل عملکرد من"),
+    ("setrisk", "⚖️ تنظیم موجودی و ریسک"),
+    ("myrisk", "⚖️ تنظیمات ریسک فعلی"),
+    ("news", "📰 اخبار بازار"),
+    ("newssettings", "⚙️ تنظیمات اخبار"),
+    ("help", "❓ راهنمای کامل"),
+]
+ADMIN_BOT_COMMANDS = [
+    ("admin", "🛠 راهنمای ادمین"),
+    ("stats", "📊 آمار ربات"),
+    ("users", "👥 لیست کاربران"),
+    ("finduser", "🔎 جستجوی کاربر"),
+    ("block", "🚫 مسدود کردن کاربر"),
+    ("unblock", "✅ رفع مسدودی"),
+    ("blocklist", "📋 لیست مسدودها"),
+    ("accessmode", "🔐 حالت دسترسی"),
+    ("whitelist", "📜 لیست سفید"),
+    ("whitelist_add", "➕ افزودن به لیست سفید"),
+    ("whitelist_remove", "➖ حذف از لیست سفید"),
+    ("broadcast", "📢 پیام همگانی"),
+    ("botanalytics", "🔬 تحلیل کل ربات"),
+    ("calibrate", "🎛 کالیبراسیون"),
+    ("backup", "💾 بکاپ فوری"),
+    ("backuplist", "🗂 لیست بکاپ‌ها"),
+    ("setwelcome", "👋 تنظیم پیام خوش‌آمد"),
+    ("getwelcome", "👋 نمایش پیام خوش‌آمد"),
+    ("removewelcome", "🗑 حذف پیام خوش‌آمد"),
+]
+
+
+async def setup_bot_commands(app: Application):
+    """منوی «/» کنار جای تایپ تلگرام؛ ادمین‌ها دستورهای ادمین رو هم می‌بینن"""
+    user_cmds = [BotCommand(c, d) for c, d in USER_BOT_COMMANDS]
+    try:
+        await app.bot.set_my_commands(user_cmds, scope=BotCommandScopeDefault())
+    except Exception as e:
+        logger.warning("ثبت منوی دستورها ناموفق بود: %s", e)
+        return
+    admin_cmds = user_cmds + [BotCommand(c, d) for c, d in ADMIN_BOT_COMMANDS]
+    for admin_id in ADMIN_IDS:
+        try:
+            await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception as e:
+            # مثلاً ادمینی که هنوز ربات رو استارت نکرده
+            logger.warning("ثبت منوی دستورهای ادمین برای %s ناموفق بود: %s", admin_id, e)
 
 
 def start_background_jobs(app: Application):
@@ -165,6 +236,7 @@ async def run_bot_only(app: Application):
     async with app:
         await app.start()
         await app.updater.start_polling(allowed_updates=["message", "callback_query"])
+        await setup_bot_commands(app)
         start_background_jobs(app)
         logger.info("ربات در حال اجراست (polling، بدون پنل وب)...")
         try:
@@ -186,6 +258,7 @@ async def run_bot_and_web(app: Application):
     async with app:
         await app.start()
         await app.updater.start_polling(allowed_updates=["message", "callback_query"])
+        await setup_bot_commands(app)
         start_background_jobs(app)
         logger.info("ربات در حال اجراست (polling) + پنل وب روی پورت %s...", WEB_PANEL_PORT)
         try:
